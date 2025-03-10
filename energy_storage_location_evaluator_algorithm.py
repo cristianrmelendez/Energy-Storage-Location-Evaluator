@@ -35,7 +35,7 @@ from qgis.PyQt.QtCore import (QCoreApplication, QVariant)
 from qgis.core import (QgsProcessing,
                        QgsProcessingAlgorithm,
                        QgsProcessingParameterFeatureSource,
-                       QgsProcessingParameterDistance,
+                       QgsProcessingParameterNumber,
                        QgsProcessingParameterFeatureSink,
                        QgsProcessingParameterMultipleLayers,
                        QgsProcessingParameterString,
@@ -47,6 +47,12 @@ from qgis.core import (QgsProcessing,
                        QgsWkbTypes,
                        QgsFeatureSink,
                        QgsProcessingException,
+                       QgsPointXY,
+                       QgsProject,
+                       QgsCoordinateTransform,
+                       QgsCoordinateReferenceSystem,
+                       QgsGeometry,
+                       QgsRectangle
                        )
 
 from .candidate import Candidate
@@ -61,13 +67,14 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
     CANDIDATES_LAYER = 'CANDIDATES_LAYER'
     BUFFER_DISTANCE = 'BUFFER_DISTANCE'
     CRITICAL_INFRASTRUCTURES = 'CRITICAL_INFRASTRUCTURES'
+    INFRASTRUCTURE_WEIGHTS = 'INFRASTRUCTURE_WEIGHTS'
     CENSUS_DATA_LAYER = 'CENSUS_DATA_LAYER'
     CENSUS_DATA_WEIGHTS = 'CENSUS_DATA_WEIGHTS'
     CRITICAL_ZONES = 'CRITICAL_ZONES'
     CRITICAL_ZONE_SCORES = 'CRITICAL_ZONE_SCORES'
 
     # Outputs
-    OUTPUT = 'OUTPUT'  # Add this line
+    OUTPUT = 'OUTPUT'
 
     def initAlgorithm(self, config=None):
 
@@ -85,8 +92,8 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
                 self.DISTANCE_METHOD,
                 self.tr('Select distance calculation method '
                         '(Only for static case, for mobile the only option is time travel through the road network'),
-                options=['Haversine distance (straight-line)', 'Road distance'],
-                defaultValue=0  # Default to Haversine distance
+                options=['Road distance', 'Haversine distance (straight-line)', ],
+                defaultValue=0  # Default to Road distance
             )
         )
 
@@ -99,12 +106,12 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
         )
 
         self.addParameter(
-            QgsProcessingParameterDistance(
+            QgsProcessingParameterNumber(
                 self.BUFFER_DISTANCE,
-                self.tr('Buffer distance in km'),
-                parentParameterName=self.CANDIDATES_LAYER,
+                self.tr('Buffer distance (in kilometers)'),
+                QgsProcessingParameterNumber.Double,
                 defaultValue=1.0,
-                minValue=0
+                minValue=0.0
             )
         )
 
@@ -116,12 +123,12 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # Add a string parameter for users to input weights separated by a comma, space, or another delimiter
+        # Add the parameter for critical infrastructure weights with the correct name
         self.addParameter(
             QgsProcessingParameterString(
-                'INFRASTRUCTURE_WEIGHTS',
+                self.INFRASTRUCTURE_WEIGHTS,
                 self.tr('Enter the weights for each infrastructure layer (comma-separated)'
-                        ' in the same order as the layers. It must sum to 1.0.'),
+                        ' in the same order as the layers. Must sum to 1.0.'),
                 defaultValue='0.25,0.25,0.25,0.25'  # Example default value for 4 layers
             )
         )
@@ -171,130 +178,828 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
         return ''.join([c if c.isalnum() or c == '_' else '' for c in layer_name.replace(' ', '_')])
 
     def processAlgorithm(self, parameters, context, feedback):
-        print("Starting processAlgorithm")
-        candidate_layer = self.parameterAsSource(parameters, self.CANDIDATES_LAYER, context)
-        buffer_distance = self.parameterAsDouble(parameters, self.BUFFER_DISTANCE, context)
-        energy_storage_type = self.parameterAsEnum(parameters, self.EVALUATION_TYPE, context)
-        distance_method = self.parameterAsEnum(parameters, self.DISTANCE_METHOD, context)
-
-        infra_layers = self.parameterAsLayerList(parameters, self.CRITICAL_INFRASTRUCTURES, context)
-        infra_weights_str = self.parameterAsString(parameters, 'INFRASTRUCTURE_WEIGHTS', context)
-        infra_weights = [float(w) for w in infra_weights_str.split(',')]
-
-        if len(infra_weights) != len(infra_layers):
-            raise QgsProcessingException(
-                "The number of weights does not match the number of critical infrastructure layers.")
-
-        print(f"Energy Storage Type: {energy_storage_type}, Distance Method: {distance_method}")
-
-        road_analyzer = RoadNetworkAnalyzer()
-        candidates = []
-
-        for feature in candidate_layer.getFeatures():
-            candidate = Candidate(feature, buffer_distance)
-            candidates.append(candidate)
-
-        for i, infra_layer in enumerate(infra_layers):
-            infra_name = self.safe_field_name(infra_layer.name())
-            weight = infra_weights[i]
-            print(f"Processing infrastructure: {infra_name} with weight {weight}")
-            for candidate in candidates:
-                intersecting_features = self.get_intersecting_features(candidate.buffer, infra_layer)
-                for infra_feature in intersecting_features:
-                    if energy_storage_type == 0:  # Static
-                        if distance_method == 0:  # Haversine
-                            distance = candidate.feature.geometry().distance(infra_feature.geometry())
-                            print(f"Haversine Distance: {distance}")
-                        else:  # Road distance
-                            start_point = candidate.feature.geometry().asPoint()
-                            end_point = infra_feature.geometry().asPoint()
-                            distance = road_analyzer.calculate_road_distance(start_point.x(), start_point.y(),
-                                                                             end_point.x(), end_point.y())
-                            print(f"Road Distance: {distance}")
-                    else:  # Mobile, using ETA
-                        start_point = candidate.feature.geometry().asPoint()
-                        end_point = infra_feature.geometry().asPoint()
-                        distance = road_analyzer.calculate_eta(start_point.x(), start_point.y(), end_point.x(),
-                                                               end_point.y())
-                        print(f"ETA: {distance}")
-
-                    score = (buffer_distance - distance) * weight
-                    print(f"Calculated Score: {score}")
-                    candidate.add_infrastructure_score(infra_name, 1, score)
-
-        for candidate in candidates:
-            candidate.calculate_final_score()
-            print(f"Candidate Final Score: {candidate.final_score}")
-
-        #################### Generate the output Layer
+        """
+        Process the algorithm and evaluate energy storage locations.
+        """
+        # Store feedback object for use in other methods
+        self.feedback = feedback
+        
+        feedback.pushInfo("Starting processAlgorithm")
+        
+        # Initialize buffer_fields for output layer
         buffer_fields = QgsFields()
         buffer_fields.append(QgsField('id', QVariant.Int))
         buffer_fields.append(QgsField('name', QVariant.String))
-        # Add fields for each infrastructure type's count and score
+        
+        # Get input parameters
+        candidate_layer = self.parameterAsSource(parameters, self.CANDIDATES_LAYER, context)
+        buffer_distance_km = self.parameterAsDouble(parameters, self.BUFFER_DISTANCE, context)
+        energy_storage_type = self.parameterAsEnum(parameters, self.EVALUATION_TYPE, context)
+        distance_method = self.parameterAsEnum(parameters, self.DISTANCE_METHOD, context)
+        
+        # Get infrastructure layers and add their fields
+        infra_layers = self.parameterAsLayerList(parameters, self.CRITICAL_INFRASTRUCTURES, context)
+        for layer in infra_layers:
+            infra_name = self.safe_field_name(layer.name())
+            buffer_fields.append(QgsField(f'{infra_name}_Count', QVariant.Int))
+            buffer_fields.append(QgsField(f'{infra_name}_Raw_Score', QVariant.Double))  # Add raw score field
+            buffer_fields.append(QgsField(f'{infra_name}_Normalized_Score', QVariant.Double))
+        
+        # Add total infrastructure score field
+        buffer_fields.append(QgsField('Total_Infrastructure_Score', QVariant.Double))
+        
+        // ...existing code...
+        # Extract census variables from the census layer
+        census_fields = census_layer.fields()
+        # According to documentation, census variables start after the 6th field (geoid)
+        census_variables = []
+        for i in range(6, len(census_fields)):
+            field_name = census_fields.at(i).name()
+            census_variables.append(field_name)
+            
+        feedback.pushInfo(f"Detected census variables: {', '.join(census_variables)}")
+        // ...existing code...
 
+        self.addParameter(
+            QgsProcessingParameterFeatureSource(
+                self.CENSUS_DATA_LAYER,
+                self.tr('Input here you Census Data Layer'),
+                [QgsProcessing.TypeVectorPolygon]  # Accept only polygon layers
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterString(
+                self.CENSUS_DATA_WEIGHTS,
+                self.tr('Enter weights for the census data variables (comma-separated)'),
+                defaultValue='0.25,0.25,0.25,0.25'  # Example default value for 4 layers
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterMultipleLayers(
+                self.CRITICAL_ZONES,
+                self.tr('Critical Zones Layers'),
+                QgsProcessing.TypeVectorPolygon  # Only polygon layers
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterString(
+                self.CRITICAL_ZONE_SCORES,
+                self.tr('Enter the scores for each critical zone layer (comma-separated)'
+                        ' in the same order as the layers. Use negative values to subtract score.'),
+                defaultValue='10,-5,-10'  # Example default value
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT,  # This is the key line to define the OUTPUT parameter
+                self.tr('Output layer')
+            )
+        )
+
+    def safe_field_name(self, layer_name):
+        # Replace spaces with underscores and remove special characters
+        return ''.join([c if c.isalnum() or c == '_' else '' for c in layer_name.replace(' ', '_')])
+
+    def processAlgorithm(self, parameters, context, feedback):
+        """
+        Process the algorithm and evaluate energy storage locations.
+        """
+        # Store feedback object for use in other methods
+        self.feedback = feedback
+        
+        feedback.pushInfo("Starting processAlgorithm")
+        
+        // ...existing code...
+        # Get the census variable names from columns after index 6 
+        census_variables = []
+        for field in census_fields[6:]:  # Start from index 6 onwards
+            field_name = field.name()
+            if field_name not in ['id', 'name', 'statefp', 'countyfp', 'cousubfp', 'geoid']:
+                census_variables.append(field_name)
+        // ...existing code...
+
+        # Add total census score field
+        buffer_fields.append(QgsField('Total_Census_Score', QVariant.Double))
+        
+        # Get zone layers and add their score fields
+        zone_layers = self.parameterAsLayerList(parameters, self.CRITICAL_ZONES, context)
+        for layer in zone_layers:
+            zone_name = self.safe_field_name(layer.name())
+            buffer_fields.append(QgsField(f'{zone_name}_Score', QVariant.Double))
+        
+        # Add total zones score field
+        buffer_fields.append(QgsField('Total_Zones_Score', QVariant.Double))
+        
+        # Add final score field
+        buffer_fields.append(QgsField('Final_Score', QVariant.Double))
+        
+        # Convert buffer distance from km to meters for internal calculations
+        buffer_distance = buffer_distance_km * 1000  # Convert km to meters
+
+        # Log coordinate reference system info for debugging
+        feedback.pushInfo(f"Candidate layer CRS: {candidate_layer.sourceCrs().authid()}")
+
+        # Critical infrastructure layers and their weights
+        infra_layers = self.parameterAsLayerList(parameters, self.CRITICAL_INFRASTRUCTURES, context)
+        infra_weights_str = self.parameterAsString(parameters, self.INFRASTRUCTURE_WEIGHTS, context)
+        
+        // ...existing code...
+        # Log each infrastructure layer CRS 
+        for i, layer in enumerate(infra_layers):
+            feedback.pushInfo(f"Infrastructure layer {i+1} ({layer.name()}) CRS: {layer.crs().authid()}")
+        
+        // ...existing code...
+        # Census data parameters
+        census_layer = self.parameterAsSource(parameters, self.CENSUS_DATA_LAYER, context)
+        census_weights_str = self.parameterAsString(parameters, self.CENSUS_DATA_WEIGHTS, context)
+        
+        // ...existing code...
+        # Critical zones and their scores
+        zone_layers = self.parameterAsLayerList(parameters, self.CRITICAL_ZONES, context) 
+        zone_scores_str = self.parameterAsString(parameters, self.CRITICAL_ZONE_SCORES, context)
+        
+        // ...existing code...
+        # Validate and parse infrastructure weights
+        try:
+            infra_weights = [float(w) for w in infra_weights_str.split(',')]
+        except ValueError:
+            raise QgsProcessingException("Infrastructure weights must be numeric values separated by commas.")
+        
+        if len(infra_weights) != len(infra_layers):
+            raise QgsProcessingException(
+                f"The number of weights ({len(infra_weights)}) does not match the number of critical infrastructure layers ({len(infra_layers)}).")
+        
+        // ...existing code...
+        # Check if weights sum to 1.0 (allowing small floating point error)
+        if not 0.999 <= sum(infra_weights) <= 1.001:
+            raise QgsProcessingException(
+                f"Infrastructure weights sum to {sum(infra_weights)}, but they must sum to 1.0.")
+            
+        // ...existing code...
+        # Normalize weights in case of small floating point error
+        weight_sum = sum(infra_weights)
+        if weight_sum != 1.0:
+            infra_weights = [w/weight_sum for w in infra_weights]
+        
+        // ...existing code...
+        # Extract census variables from the census layer
+        census_fields = census_layer.fields()
+        // ...existing code...
+        # According to documentation, census variables start after the 6th field (geoid)
+        census_variables = []
+        for i in range(6, len(census_fields)):
+            field_name = census_fields.at(i).name()
+            census_variables.append(field_name)
+            
+        feedback.pushInfo(f"Detected census variables: {', '.join(census_variables)}")
+            
+        // ...existing code...
+        # Validate and parse census weights
+        try:
+            census_weights = [float(w) for w in census_weights_str.split(',')]
+        except ValueError:
+            raise QgsProcessingException("Census weights must be numeric values separated by commas.")
+            
+        if len(census_weights) != len(census_variables):
+            raise QgsProcessingException(
+                f"The number of census weights ({len(census_weights)}) does not match the number of census variables ({len(census_variables)}).")
+        
+        if not 0.999 <= sum(census_weights) <= 1.001:
+            raise QgsProcessingException(
+                f"Census weights sum to {sum(census_weights)}, but they must sum to 1.0.")
+        
+        // ...existing code...
+        # Normalize census weights
+        census_weight_sum = sum(census_weights)
+        if census_weight_sum != 1.0:
+            census_weights = [w/census_weight_sum for w in census_weights]
+            
+        // ...existing code...
+        # Validate and parse critical zone scores
+        try:
+            zone_scores = [float(s) for s in zone_scores_str.split(',')]
+        except ValueError:
+            raise QgsProcessingException("Critical zone scores must be numeric values separated by commas.")
+            
+        if len(zone_scores) != len(zone_layers):
+            raise QgsProcessingException(
+                f"The number of zone scores ({len(zone_scores)}) does not match the number of critical zone layers ({len(zone_layers)}).")
+
+        feedback.pushInfo(f"Energy Storage Type: {energy_storage_type}, Distance Method: {distance_method}")
+        feedback.pushInfo(f"Buffer Distance: {buffer_distance_km} km ({buffer_distance} meters)")
+        
+        // ...existing code...
+        # Initialize road network analyzer for distance calculations
+        road_analyzer = RoadNetworkAnalyzer()
+        
+        // ...existing code...
+        # Test OSRM connectivity
+        try:
+            feedback.pushInfo("Testing OSRM connectivity...")
+            // ...existing code...
+            # Test coordinates near San Juan, PR
+            test_result = road_analyzer.get_route_info(-66.1057, 18.4655, -66.0949, 18.4596)
+            feedback.pushInfo(f"OSRM test successful, distance: {test_result['distance']:.2f} meters, duration: {test_result['duration']:.2f} seconds")
+        except Exception as e:
+            feedback.reportError(f"OSRM test failed: {str(e)}. Road distance calculations will fall back to Haversine.")
+            feedback.pushInfo("Make sure OSRM server is running on http://127.0.0.1:5001")
+        
+        // ...existing code...
+        # Create candidate objects from features
+        candidates = []
+        total_candidates = candidate_layer.featureCount()
+        feedback.pushInfo(f"Processing {total_candidates} candidate sites...")
+        
+        for i, feature in enumerate(candidate_layer.getFeatures()):
+            if feedback.isCanceled():
+                break
+                
+            // ...existing code...
+            # Pass feedback to candidate for better logging
+            candidate = Candidate(feature, buffer_distance, feedback)
+            candidates.append(candidate)
+            
+            // ...existing code...
+            # Update progress
+            feedback.setProgress(int((i / total_candidates) * 10))  # Use first 10% for candidate creation
+        
+        // ...existing code...
+        # 1. EVALUATE CRITICAL ZONES FIRST
+        feedback.pushInfo("Step 1: Evaluating candidates against critical zones...")
+        
+        for i, zone_layer in enumerate(zone_layers):
+            zone_name = self.safe_field_name(zone_layer.name())
+            zone_score = zone_scores[i]
+            
+            feedback.pushInfo(f"Processing critical zone: {zone_name} with score {zone_score}")
+            feedback.pushInfo(f"Zone layer CRS: {zone_layer.crs().authid()}")
+            
+            for j, candidate in enumerate(candidates):
+                if feedback.isCanceled():
+                    break
+                    
+                // ...existing code...
+                # Check if candidate intersects with zone
+                intersects = False
+                for zone_feature in zone_layer.getFeatures():
+                    if zone_feature.geometry().intersects(candidate.feature.geometry()):
+                        intersects = True
+                        break
+                        
+                if intersects:
+                    // ...existing code...
+                    # Apply zone score - could be positive or negative
+                    candidate.set_critical_zone_score(zone_name, zone_score)
+                    feedback.pushInfo(f"Candidate {j+1} intersects with {zone_name}, score: {zone_score}")
+                else:
+                    // ...existing code...
+                    # No intersection, no score impact
+                    candidate.set_critical_zone_score(zone_name, 0)
+            
+            // ...existing code...
+            # Update progress
+            feedback.setProgress(10 + int((i / len(zone_layers)) * 20))  # Use 10-30% for zones
+        
+        feedback.pushInfo(f"Critical zone evaluation completed for all {len(candidates)} candidates")
+        
+        // ...existing code...
+        # 2. PROCESS INFRASTRUCTURE FOR EACH CANDIDATE
+        feedback.pushInfo("Step 2: Evaluating candidates against critical infrastructure...")
+        
+        // ...existing code...
+        # Dictionary to store min/max scores for each infrastructure type for normalization
+        infra_score_ranges = {}
+        
+        for i, infra_layer in enumerate(infra_layers):
+            self.processInfrastructureLayer(infra_layer, candidates, feedback)
+        
+        // ...existing code...
+        # 3. PROCESS CENSUS DATA FOR EACH CANDIDATE
+        feedback.pushInfo("Step 3: Evaluating candidates against census data...")
+        
+        // ...existing code...
+        # Dictionary to store min/max values for each census variable for normalization
+        census_value_ranges = {var: {'min': float('inf'), 'max': float('-inf')} for var in census_variables}
+        
+        for j, candidate in enumerate(candidates):
+            if feedback.isCanceled():
+                break
+            
+            // ...existing code...
+            # Find the census area(s) that contain this candidate
+            containing_census_features = []
+            for census_feature in census_layer.getFeatures():
+                if census_feature.geometry().contains(candidate.feature.geometry()):
+                    containing_census_features.append(census_feature)
+            
+            feedback.pushInfo(f"Found {len(containing_census_features)} census areas containing candidate {j+1}")
+            
+            // ...existing code...
+            # Extract and store census values for this candidate
+            if containing_census_features:
+                // ...existing code...
+                # If multiple census areas contain the candidate, use the first one
+                // ...existing code...
+                # (A more sophisticated approach could average or weight values from all containing areas)
+                census_feature = containing_census_features[0]
+                
+                for v, variable in enumerate(census_variables):
+                    if variable not in census_feature.fields().names():
+                        feedback.reportError(f"Census variable '{variable}' not found in census layer")
+                        continue
+                    
+                    value = census_feature[variable]
+                    candidate.census_data[variable] = value
+                    
+                    // ...existing code...
+                    # Update min/max values for normalization
+                    census_value_ranges[variable]['min'] = min(census_value_ranges[variable]['min'], value)
+                    census_value_ranges[variable]['max'] = max(census_value_ranges[variable]['max'], value)
+                    
+                    feedback.pushInfo(f"Census {variable} for candidate {j+1}: {value}")
+            else:
+                feedback.pushInfo(f"No census areas found containing candidate {j+1}")
+                for variable in census_variables:
+                    candidate.census_data[variable] = 0
+            
+            // ...existing code...
+            # Update progress
+            feedback.setProgress(50 + int((j / len(candidates)) * 20))  # Use 50-70% for census data
+        
+        // ...existing code...
+        # 4. NORMALIZE SCORES FOR INFRASTRUCTURE AND CENSUS DATA
+        feedback.pushInfo("Step 4: Normalizing all scores...")
+        
+        // ...existing code...
+        # Before normalizing scores, ensure all candidates have entries for all infrastructures
         for infra_layer in infra_layers:
             infra_name = self.safe_field_name(infra_layer.name())
-            buffer_fields.append(QgsField(f'{infra_name}_Count', QVariant.Int))
-            buffer_fields.append(QgsField(f'{infra_name}_Score', QVariant.Double))
+            for candidate in candidates:
+                // ...existing code...
+                # Initialize the score to 0 if it doesn't exist
+                if infra_name not in candidate.infrastructures:
+                    candidate.update_infrastructure_count(infra_name)
+                    candidate.set_infrastructure_score(infra_name, 0.0)
+                    
+        // ...existing code...
+        # Compute actual min/max scores across all candidates for each infrastructure type
+        for infra_name in [self.safe_field_name(layer.name()) for layer in infra_layers]:
+            scores = [c.infrastructures.get(infra_name, {}).get('score', 0.0) for c in candidates]
+            if scores:
+                min_score = min(scores)
+                max_score = max(scores)
+                infra_score_ranges[infra_name] = {'min': min_score, 'max': max_score}
+                feedback.pushInfo(f"Score range for {infra_name}: {min_score} to {max_score}")
+        
+        // ...existing code...
+        # Normalize infrastructure scores
+        for infra_name, score_range in infra_score_ranges.items():
+            min_score = score_range['min']
+            max_score = score_range['max']
+            
+            // ...existing code...
+            # If all scores are the same, prevent division by zero
+            if min_score == max_score:
+                // ...existing code...
+                # If all are zero, set normalized score to 0
+                if min_score == 0.0:
+                    normalized_value = 0.0
+                // ...existing code...
+                # Otherwise, set to a positive value
+                else:
+                    normalized_value = 1.0 if min_score > 0 else 0.0
+                    
+                feedback.pushInfo(f"All {infra_name} scores identical ({min_score}), normalized to {normalized_value}")
+                
+                for candidate in candidates:
+                    candidate.set_infrastructure_score(infra_name, normalized_value)
+            else:
+                // ...existing code...
+                # Normal case: Apply normalization formula
+                for candidate in candidates:
+                    raw_score = candidate.infrastructures.get(infra_name, {}).get('score', 0.0)
+                    normalized_score = (raw_score - min_score) / (max_score - min_score)
+                    candidate.set_infrastructure_score(infra_name, normalized_score)
+        
+        // ...existing code...
+        # Similar approach for census data
+        // ...existing code...
+        # Ensure all candidates have entries for all census variables
+        for variable in census_variables:
+            for candidate in candidates:
+                if variable not in candidate.census_data:
+                    candidate.census_data[variable] = 0.0
+                    
+        // ...existing code...
+        # Compute actual min/max values for census variables
+        for variable in census_variables:
+            values = [c.census_data.get(variable, 0.0) for c in candidates]
+            if values:
+                min_value = min(values)
+                max_value = max(values)
+                census_value_ranges[variable] = {'min': min_value, 'max': max_value}
+                feedback.pushInfo(f"Value range for {variable}: {min_value} to {max_value}")
+        
+        // ...existing code...
+        # Normalize and weight census data
+        for v, variable in enumerate(census_variables):
+            min_value = census_value_ranges[variable]['min']
+            max_value = census_value_ranges[variable]['max']
+            weight = census_weights[v]
+            
+            // ...existing code...
+            # If all values are the same, prevent division by zero
+            if min_value == max_value:
+                if min_value == 0:
+                    normalized_value = 0.0
+                else:
+                    normalized_value = 1.0 if min_value > 0 else 0.0
+                
+                weighted_score = normalized_value * weight
+                feedback.pushInfo(f"All {variable} values identical ({min_value}), normalized to {normalized_value}, weighted to {weighted_score}")
+                
+                for candidate in candidates:
+                    candidate.set_census_data_score(variable, weighted_score)
+            else:
+                // ...existing code...
+                # Normal case: Apply normalization and weighting
+                for candidate in candidates:
+                    value = candidate.census_data.get(variable, 0.0)
+                    normalized_value = (value - min_value) / (max_value - min_value)  # Fixed: using max_value instead of max_score
+                    weighted_score = normalized_value * weight
+                    candidate.set_census_data_score(variable, weighted_score)
+            
+        // ...existing code...
+        # Process census data
+        all_income_values = [c.census_data.get('median_income', 0) for c in candidates]
+        all_population_values = [c.census_data.get('total_population', 0) for c in candidates]
+        all_under18_values = [c.census_data.get('under_18', 0) for c in candidates]
+        all_over64_values = [c.census_data.get('over_64', 0) for c in candidates]
 
-        # Add fields for census data and critical zones if you are processing them similarly
-        # buffer_fields.append(QgsField('Census_Data_Score', QVariant.Double))
-        # buffer_fields.append(QgsField('Critical_Zone_Score', QVariant.Double))
+        // ...existing code...
+        # Get min-max values for normalization
+        max_income = max(all_income_values) if all_income_values else 1
+        max_population = max(all_population_values) if all_population_values else 1
+        max_under18 = max(all_under18_values) if all_under18_values else 1
+        max_over64 = max(all_over64_values) if all_over64_values else 1
 
-        # Finally, add a field for the final score
-        buffer_fields.append(QgsField('Final_Score', QVariant.Double))
+        // ...existing code...
+        # Normalize census data for each candidate
+        for candidate in candidates:
+            // ...existing code...
+            # Normalize income (0-1 scale)
+            income_score = candidate.census_data.get('median_income', 0) / max_income if max_income > 0 else 0
+            candidate.set_census_data_score('median_income', income_score)
 
+            // ...existing code...
+            # Normalize population (0-1 scale)
+            population_score = candidate.census_data.get('total_population', 0) / max_population if max_population > 0 else 0
+            candidate.set_census_data_score('total_population', population_score)
+
+            // ...existing code...
+            # Normalize age demographics (0-1 scale)
+            under18_score = candidate.census_data.get('under_18', 0) / max_under18 if max_under18 > 0 else 0
+            candidate.set_census_data_score('under_18', under18_score)
+
+            over64_score = candidate.census_data.get('over_64', 0) / max_over64 if max_over64 > 0 else 0
+            candidate.set_census_data_score('over_64', over64_score)
+
+            feedback.pushInfo(f"Census scores for candidate {candidate.feature['id']}:")
+            feedback.pushInfo(f"Income Score: {income_score:.3f}")
+            feedback.pushInfo(f"Population Score: {population_score:.3f}")
+            feedback.pushInfo(f"Under 18 Score: {under18_score:.3f}")
+            feedback.pushInfo(f"Over 64 Score: {over64_score:.3f}")
+        
+        // ...existing code...
+        # Get the census variable names from columns after index 6 
+        census_variables = []
+        for field in census_fields[6:]:  # Start from index 6 onwards
+            field_name = field.name()
+            if field_name not in ['id', 'name', 'statefp', 'countyfp', 'cousubfp', 'geoid']:
+                census_variables.append(field_name)
+        
+        // ...existing code...
+        # Process each census variable dynamically
+        for variable in census_variables:
+            // ...existing code...
+            # Get all values for current variable
+            values = [c.census_data.get(variable, 0) for c in candidates]
+            max_value = max(values) if values else 1  # Avoid division by zero
+            
+            // ...existing code...
+            # Normalize values for each candidate (0-1 scale)
+            for candidate in candidates:
+                value = candidate.census_data.get(variable, 0)
+                normalized_score = value / max_value if max_value > 0 else 0
+                candidate.set_census_data_score(variable, normalized_score)
+                
+                feedback.pushInfo(f"Census scores for candidate {candidate.feature['id']}:")
+                feedback.pushInfo(f"{variable} Score: {normalized_score:.3f}")
+        
+        // ...existing code...
         # Create the output layer
         (sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT, context, buffer_fields, QgsWkbTypes.Polygon,
                                                candidate_layer.sourceCrs())
-
+        
+        // ...existing code...
         # Populate the output layer with features
-        for candidate in candidates:
+        for candidate in candidates:  # Iterate over valid candidates
+            if feedback.isCanceled():
+                break
+                
+            // ...existing code...
             # Create a new feature for the output layer
             out_feature = QgsFeature(buffer_fields)
             out_feature.setGeometry(candidate.buffer)  # Set the buffer geometry as the feature's geometry
-
-            # Prepare the attributes list starting with ID and name
-            attributes = [candidate.feature['id'], candidate.feature['name']]
-
+            
+            // ...existing code...
+            # Get the candidate's ID and name directly from the feature's attributes
+            // ...existing code...
+            # If the field exists but the value is NULL, use a default value
+            candidate_id = None
+            candidate_name = None
+            
+            if 'Id' in candidate.feature.fields().names():
+                field_idx = candidate.feature.fields().indexFromName('Id')
+                candidate_id = candidate.feature.attributes()[field_idx]
+                
+            if 'Name' in candidate.feature.fields().names():
+                field_idx = candidate.feature.fields().indexFromName('Name')
+                candidate_name = candidate.feature.attributes()[field_idx]
+            
+            // ...existing code...
+            # Use defaults if values are still None
+            if candidate_id is None:
+                candidate_id = candidates.index(candidate)
+            if candidate_name is None or candidate_name == '':
+                candidate_name = f"Candidate {candidate_id}"
+                
+            // ...existing code...
+            # Start the attributes list with ID and name
+            attributes = [candidate_id, candidate_name]
+            
+            // ...existing code...
             # Append the counts and scores for each infrastructure type
+            total_infra_score = 0
             for infra_layer in infra_layers:
                 infra_name = self.safe_field_name(infra_layer.name())
                 count = candidate.infrastructures.get(infra_name, {}).get('count', 0)
-                score = candidate.infrastructures.get(infra_name, {}).get('score', 0)
-                attributes += [count, score]
-
-            # Append census data and critical zones scores if applicable
-            # attributes.append(candidate.census_data_score)
-            # attributes.append(candidate.critical_zone_score)
-
-            # Append the final score
-            attributes.append(candidate.final_score)
-
+                raw_score = candidate.infrastructures.get(infra_name, {}).get('raw_score', 0)  # Get the raw score
+                normalized_score = candidate.infrastructures.get(infra_name, {}).get('normalized_score', 0)  # Get the normalized score
+                attributes += [count, raw_score, normalized_score]
+                total_infra_score += normalized_score  # Use normalized score for total
+            
+            // ...existing code...
+            # Add the total infrastructure score
+            attributes.append(total_infra_score)
+            
+            // ...existing code...
+            # Add census data values and scores
+            total_census_score = 0
+            for variable in census_variables:
+                value = candidate.census_data.get(variable, 0)
+                score = candidate.census_data.get(variable + "_score", 0)
+                attributes += [value, score]
+                total_census_score += score
+                
+            // ...existing code...
+            # Add the total census score
+            attributes.append(total_census_score)
+            
+            // ...existing code...
+            # Add critical zone scores and calculate total
+            total_zone_score = 0
+            for zone_layer in zone_layers:
+                zone_name = self.safe_field_name(zone_layer.name())
+                score = candidate.critical_zones.get(zone_name, 0)
+                attributes.append(score)
+                total_zone_score += score
+                
+            // ...existing code...
+            # Add the total critical zone score
+            attributes.append(total_zone_score)
+            
+            // ...existing code...
+            # Calculate and append the final total score (sum of all components)
+            total_score = total_infra_score + total_census_score + total_zone_score
+            attributes.append(total_score)
+            
+            // ...existing code...
             # Assign the attributes to the output feature and add it to the sink
             out_feature.setAttributes(attributes)
             sink.addFeature(out_feature, QgsFeatureSink.FastInsert)
+            
+            // ...existing code...
+            # Update progress
+            feedback.setProgress(80 + int((candidates.index(candidate) / len(candidates)) * 20))  # Use final 20% for output
 
+        // ...existing code...
         # Return the results including the output layer
+        feedback.pushInfo("Processing completed successfully")
         return {self.OUTPUT: dest_id}
 
     def get_intersecting_features(self, buffer, layer):
-        print("Getting intersecting features")
+        """
+        Get features from layer that intersect with buffer geometry.
+        
+        Args:
+            buffer: Buffer geometry in the candidate's CRS
+            layer: Layer to get features from, potentially in a different CRS
+            
+        Returns:
+            List of features that intersect with buffer
+        """
         intersecting_features = []
-        # Commenting out the bounding box filter for debugging
-        # request = QgsFeatureRequest().setFilterRect(buffer.boundingBox())
-        for feature in layer.getFeatures():  # Removed the request object
+        
+        // ...existing code...
+        # Check if the buffer geometry is valid
+        if not buffer.isGeosValid():
+            self.feedback.reportError(f"Buffer geometry is not valid for layer: {layer.name()}")
+            return intersecting_features
+        
+        // ...existing code...
+        # Debug buffer information
+        self.feedback.pushInfo(f"Buffer type: {buffer.wkbType()}, area: {buffer.area():.2f} sq meters")
+        
+        // ...existing code...
+        # Get buffer CRS information
+        buffer_crs = QgsProject.instance().crs()
+        layer_crs = layer.crs()
+        
+        self.feedback.pushInfo(f"Buffer CRS: {buffer_crs.authid()}, Layer CRS: {layer_crs.authid()}")
+        
+        // ...existing code...
+        # Get the buffer centroid for debugging
+        centroid = buffer.centroid().asPoint()
+        self.feedback.pushInfo(f"Buffer centroid: ({centroid.x():.6f}, {centroid.y():.6f})")
+        
+        // ...existing code...
+        # Calculate approximate buffer radius from area (for debugging)
+        buffer_radius = (buffer.area() / 3.14159) ** 0.5
+        self.feedback.pushInfo(f"Calculated buffer radius: {buffer_radius:.2f} meters")
+        
+        // ...existing code...
+        # Create a copy of the buffer geometry for transformation
+        buffer_geom = QgsGeometry(buffer)
+        
+        // ...existing code...
+        # Transform buffer to layer CRS if needed
+        if buffer_crs.authid() != layer_crs.authid():
+            self.feedback.pushInfo(f"Transforming buffer from {buffer_crs.authid()} to {layer_crs.authid()}")
+            try:
+                transform = QgsCoordinateTransform(buffer_crs, layer_crs, QgsProject.instance())
+                buffer_geom.transform(transform)
+                
+                // ...existing code...
+                # Debug the transformed buffer
+                transformed_centroid = buffer_geom.centroid().asPoint()
+                self.feedback.pushInfo(f"Transformed buffer centroid: ({transformed_centroid.x():.6f}, {transformed_centroid.y():.6f})")
+                self.feedback.pushInfo(f"Transformed buffer area: {buffer_geom.area():.2f} sq meters")
+            except Exception as e:
+                self.feedback.reportError(f"Error transforming buffer: {str(e)}")
+                // ...existing code...
+                # In case of transformation error, return empty result
+                return intersecting_features
+        
+        // ...existing code...
+        # Get the correct bounding box from the buffer geometry
+        bbox = buffer_geom.boundingBox()
+        
+        // ...existing code...
+        # Debug the bounding box (should be in the layer's CRS)
+        self.feedback.pushInfo(f"Bounding box min: ({bbox.xMinimum():.6f}, {bbox.yMinimum():.6f})")
+        self.feedback.pushInfo(f"Bounding box max: ({bbox.xMaximum():.6f}, {bbox.yMaximum():.6f})")
+        self.feedback.pushInfo(f"Bounding box width: {bbox.width():.6f}, height: {bbox.height():.6f}")
+        
+        // ...existing code...
+        # ALWAYS create a manual bounding box for more reliable results
+        // ...existing code...
+        # This fixes the issue with invalid bounding boxes
+        center = buffer_geom.centroid().asPoint()
+        
+        // ...existing code...
+        # Set appropriate delta based on the CRS
+        if layer_crs.authid().startswith("EPSG:4326"):
+            // ...existing code...
+            # For EPSG:4326 (WGS 84), use degrees (about 2km at equator)
+            delta = 0.02
+        else:
+            // ...existing code...
+            # For projected CRSs, use meters/feet based on buffer radius
+            delta = buffer_radius * 1.1  # 10% larger than buffer radius
+        
+        // ...existing code...
+        # Create a manual bounding box
+        manual_bbox = QgsRectangle(
+            center.x() - delta,
+            center.y() - delta,
+            center.x() + delta,
+            center.y() + delta
+        )
+        
+        self.feedback.pushInfo(f"Created manual bbox: ({manual_bbox.xMinimum():.6f}, {manual_bbox.yMinimum():.6f}) - ({manual_bbox.xMaximum():.6f}, {manual_bbox.yMaximum():.6f})")
+        bbox = manual_bbox
+        
+        // ...existing code...
+        # Use the corrected bounding box for spatial filtering
+        request = QgsFeatureRequest().setFilterRect(bbox)
+        
+        // ...existing code...
+        # Count features in layer and in bounding box
+        total_features = layer.featureCount()
+        feature_count_in_bbox = 0
+        contained_features = 0
+        
+        // ...existing code...
+        # Process features within the bounding box and check actual containment
+        for feature in layer.getFeatures(request):
+            feature_count_in_bbox += 1
             geom = feature.geometry()
-            if geom is not None:  # Check if geometry is valid
-                print(f"Checking feature {feature.id()} with geometry {geom.asWkt()}")
-                if geom.intersects(buffer):
-                    print(f"Feature {feature.id()} intersects with the buffer.")
-                    intersecting_features.append(feature)
-                else:
-                    print(f"Feature {feature.id()} does not intersect with the buffer.")
-            else:
-                print(f"Feature {feature.id()} has invalid geometry.")
+            
+            if not geom or not geom.isGeosValid():
+                self.feedback.pushInfo(f"Skipping invalid geometry in layer {layer.name()}")
+                continue
+                
+            // ...existing code...
+            # Check if the feature is truly inside or intersects the buffer
+            // ...existing code...
+            # For point features, check containment
+            if buffer_geom.contains(geom):
+                contained_features += 1
+                intersecting_features.append(feature)
+                
+                // ...existing code...
+                # Log only a limited number of points to avoid overwhelming logs
+                if contained_features <= 5:
+                    if geom.type() == QgsWkbTypes.PointGeometry:
+                        point = geom.asPoint()
+                        self.feedback.pushInfo(f"Found point inside buffer at {point.x():.6f}, {point.y():.6f}")
+            elif buffer_geom.intersects(geom):
+                // ...existing code...
+                # For non-point features that intersect but aren't contained
+                intersecting_features.append(feature)
+                contained_features += 1
+                if contained_features <= 5:
+                    self.feedback.pushInfo("Found intersecting feature (not contained)")
+        
+        // ...existing code...
+        # Report statistics
+        self.feedback.pushInfo(f"Layer {layer.name()} has {total_features} total features")
+        self.feedback.pushInfo(f"Features in bounding box: {feature_count_in_bbox}")
+        self.feedback.pushInfo(f"Features actually contained or intersecting buffer: {contained_features}")
+        
+        // ...existing code...
+        # Add containment ratio statistics if applicable
+        if feature_count_in_bbox > 0:
+            containment_ratio = contained_features / feature_count_in_bbox
+            self.feedback.pushInfo(f"Containment ratio: {containment_ratio:.2%}")
+            
         return intersecting_features
+
+    def processInfrastructureLayer(self, layer, candidates, feedback):
+        """Process each infrastructure layer dynamically"""
+        total_features = layer.featureCount()
+        layer_name = layer.name()
+        
+        feedback.pushInfo(f"Processing infrastructure layer: {layer_name}")
+        
+        // ...existing code...
+        # Get all values for current infrastructure type
+        for candidate in candidates:
+            count = 0
+            total_distance = 0
+            
+            for feature in layer.getFeatures():
+                if candidate.buffer.intersects(feature.geometry()):
+                    count += 1
+                    // ...existing code...
+                    # Calculate distance to center if needed
+                    centroid = candidate.feature.geometry().centroid()
+                    distance = centroid.distance(feature.geometry())
+                    total_distance += distance
+                    
+            // ...existing code...
+            # Store raw values
+            avg_distance = total_distance / count if count > 0 else 0
+            candidate.update_infrastructure_count(layer_name, count)
+            candidate.set_infrastructure_raw_score(layer_name, avg_distance)
+            
+        // ...existing code...
+        # Normalize scores across all candidates
+        max_count = max(c.infrastructures[layer_name]['count'] for c in candidates) if candidates else 1
+        
+        for candidate in candidates:
+            count = candidate.infrastructures[layer_name]['count']
+            normalized_score = count / max_count if max_count > 0 else 0
+            candidate.set_infrastructure_score(layer_name, normalized_score)
+            
+            feedback.pushInfo(f"Infrastructure scores for candidate {candidate.feature['id']}:")
+            feedback.pushInfo(f"{layer_name} Count: {count}")
+            feedback.pushInfo(f"{layer_name} Normalized Score: {normalized_score:.3f}")
 
     def name(self):
         """
