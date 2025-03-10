@@ -177,15 +177,139 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
         # Replace spaces with underscores and remove special characters
         return ''.join([c if c.isalnum() or c == '_' else '' for c in layer_name.replace(' ', '_')])
 
+    def _initialize_output_fields(self):
+        """Initialize the output layer fields structure."""
+        buffer_fields = QgsFields()
+        buffer_fields.append(QgsField('id', QVariant.Int))
+        buffer_fields.append(QgsField('name', QVariant.String))
+        return buffer_fields
+
+    def _validate_weights(self, weights_str, expected_count, weight_type):
+        """Validate and normalize weights.
+        
+        Args:
+            weights_str (str): Comma-separated weights
+            expected_count (int): Expected number of weights
+            weight_type (str): Type of weights for error messages
+            
+        Returns:
+            list: Normalized weights
+        """
+        try:
+            weights = [float(w) for w in weights_str.split(',')]
+        except ValueError:
+            raise QgsProcessingException(f"{weight_type} weights must be numeric values separated by commas.")
+        
+        if len(weights) != expected_count:
+            raise QgsProcessingException(
+                f"The number of {weight_type.lower()} weights ({len(weights)}) does not match "
+                f"the expected count ({expected_count}).")
+        
+        if not 0.999 <= sum(weights) <= 1.001:
+            raise QgsProcessingException(
+                f"{weight_type} weights sum to {sum(weights)}, but they must sum to 1.0.")
+        
+        # Normalize weights to exactly 1.0
+        weight_sum = sum(weights)
+        if weight_sum != 1.0:
+            weights = [w/weight_sum for w in weights]
+            
+        return weights
+
+    def _add_infrastructure_fields(self, buffer_fields, infra_layers):
+        """Add infrastructure-related fields to the output structure."""
+        for layer in infra_layers:
+            infra_name = self.safe_field_name(layer.name())
+            buffer_fields.append(QgsField(f'{infra_name}_Count', QVariant.Int))
+            buffer_fields.append(QgsField(f'{infra_name}_Raw_Score', QVariant.Double))
+            buffer_fields.append(QgsField(f'{infra_name}_Normalized_Score', QVariant.Double))
+        buffer_fields.append(QgsField('Total_Infrastructure_Score', QVariant.Double))
+        return buffer_fields
+
+    def _add_census_fields(self, buffer_fields, census_layer):
+        """Add census-related fields and extract census variables."""
+        census_fields = census_layer.fields()
+        census_variables = []
+        
+        for i in range(6, len(census_fields)):
+            field_name = census_fields.at(i).name()
+            census_variables.append(field_name)
+            buffer_fields.append(QgsField(f'{field_name}_Value', QVariant.Double))
+            buffer_fields.append(QgsField(f'{field_name}_Score', QVariant.Double))
+            
+        return buffer_fields, census_variables
+
+    def _add_zone_fields(self, buffer_fields, zone_layers):
+        """Add zone-related fields to the output structure."""
+        for layer in zone_layers:
+            zone_name = self.safe_field_name(layer.name())
+            buffer_fields.append(QgsField(f'{zone_name}_Score', QVariant.Double))
+        
+        buffer_fields.append(QgsField('Total_Zones_Score', QVariant.Double))
+        buffer_fields.append(QgsField('Final_Score', QVariant.Double))
+        return buffer_fields
+
+    def _log_crs_info(self, candidate_layer, infra_layers, feedback):
+        """Log CRS information for debugging."""
+        feedback.pushInfo(f"Candidate layer CRS: {candidate_layer.sourceCrs().authid()}")
+        for i, layer in enumerate(infra_layers):
+            feedback.pushInfo(f"Infrastructure layer {i+1} ({layer.name()}) CRS: {layer.crs().authid()}")
+
     def processAlgorithm(self, parameters, context, feedback):
-        """
-        Process the algorithm and evaluate energy storage locations.
-        """
+        """Process the algorithm."""
+        feedback.pushInfo("Starting processAlgorithm")
+
+        # Part 1: Get input parameters
+        candidate_layer = self.parameterAsSource(parameters, self.CANDIDATES_LAYER, context)
+        buffer_distance_km = self.parameterAsDouble(parameters, self.BUFFER_DISTANCE, context)
+        energy_storage_type = self.parameterAsEnum(parameters, self.EVALUATION_TYPE, context)
+        distance_method = self.parameterAsEnum(parameters, self.DISTANCE_METHOD, context)
+        
+        # Get layers and their corresponding weights/scores
+        infra_layers = self.parameterAsLayerList(parameters, self.CRITICAL_INFRASTRUCTURES, context)
+        infra_weights_str = self.parameterAsString(parameters, self.INFRASTRUCTURE_WEIGHTS, context)
+        
+        census_layer = self.parameterAsSource(parameters, self.CENSUS_DATA_LAYER, context)
+        census_weights_str = self.parameterAsString(parameters, self.CENSUS_DATA_WEIGHTS, context)
+        
+        zone_layers = self.parameterAsLayerList(parameters, self.CRITICAL_ZONES, context)
+        zone_scores_str = self.parameterAsString(parameters, self.CRITICAL_ZONE_SCORES, context)
+
+        # Part 2: Initialize output structure
+        buffer_fields = self._initialize_output_fields()
+        buffer_fields = self._add_infrastructure_fields(buffer_fields, infra_layers)
+        buffer_fields, census_variables = self._add_census_fields(buffer_fields, census_layer)
+        buffer_fields = self._add_zone_fields(buffer_fields, zone_layers)
+
+        # Part 3: Validate weights and scores
+        infra_weights = self._validate_weights(infra_weights_str, len(infra_layers), "Infrastructure")
+        census_weights = self._validate_weights(census_weights_str, len(census_variables), "Census")
+        
+        try:
+            zone_scores = [float(s) for s in zone_scores_str.split(',')]
+            if len(zone_scores) != len(zone_layers):
+                raise QgsProcessingException(
+                    f"The number of zone scores ({len(zone_scores)}) does not match "
+                    f"the number of critical zone layers ({len(zone_layers)}).")
+        except ValueError:
+            raise QgsProcessingException("Critical zone scores must be numeric values separated by commas.")
+
+        # Part 4: Convert units and log debug information
+        buffer_distance = buffer_distance_km * 1000  # Convert km to meters
+        self._log_crs_info(candidate_layer, infra_layers, feedback)
+        
+        feedback.pushInfo(f"Energy Storage Type: {energy_storage_type}, Distance Method: {distance_method}")
+        feedback.pushInfo(f"Buffer Distance: {buffer_distance_km} km ({buffer_distance} meters)")
+        feedback.pushInfo(f"Detected census variables: {', '.join(census_variables)}")
+
+        # Continue with the rest of the algorithm...
         # Store feedback object for use in other methods
         self.feedback = feedback
         
         feedback.pushInfo("Starting processAlgorithm")
         
+        ## Part 1: Initialization of Output File Structure and Input Parameters Validation
+
         # Initialize buffer_fields for output layer
         buffer_fields = QgsFields()
         buffer_fields.append(QgsField('id', QVariant.Int))
@@ -196,9 +320,10 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
         buffer_distance_km = self.parameterAsDouble(parameters, self.BUFFER_DISTANCE, context)
         energy_storage_type = self.parameterAsEnum(parameters, self.EVALUATION_TYPE, context)
         distance_method = self.parameterAsEnum(parameters, self.DISTANCE_METHOD, context)
-        
-        # Get infrastructure layers and add their fields
         infra_layers = self.parameterAsLayerList(parameters, self.CRITICAL_INFRASTRUCTURES, context)
+
+
+        # Initialize Infrastructure fields in output layer and validate weights
         for layer in infra_layers:
             infra_name = self.safe_field_name(layer.name())
             buffer_fields.append(QgsField(f'{infra_name}_Count', QVariant.Int))
@@ -207,6 +332,10 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
         
         # Add total infrastructure score field
         buffer_fields.append(QgsField('Total_Infrastructure_Score', QVariant.Double))
+
+
+
+
         
         # Get census layer and add census fields
         census_layer = self.parameterAsSource(parameters, self.CENSUS_DATA_LAYER, context)
@@ -488,23 +617,57 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
                             distance = candidate.feature.geometry().distance(infra_feature.geometry())
                             feedback.pushInfo(f"Fallback Haversine Distance to {infra_name}: {distance:.2f} meters")
                     
-                    # Since we've already filtered for features within the buffer, we can directly apply the score
-                    feature_score = max(0, (buffer_distance - distance))  # Raw score without weight
-                    weighted_score = feature_score * weight  # Apply weight for normalized score
-                    feedback.pushInfo(f"Raw score for feature: {feature_score:.2f}, Weighted score: {weighted_score:.2f}")
-                    total_infra_score += weighted_score
-                    infra_count += 1  # Increment count for each feature within the buffer
+                    # Calculate raw score without applying weight
+                    feature_score = max(0, (buffer_distance - distance))
+                    total_infra_score += feature_score
+                    infra_count += 1
                 
-                # Store infrastructure count, raw score, and weighted score for this type
-                candidate.infrastructures[infra_name] = {
-                    'count': infra_count, 
-                    'raw_score': total_infra_score / weight if weight > 0 else 0,  # Remove weight to get raw score
-                    'score': total_infra_score  # This will be normalized later
-                }
-            
+                # Store infrastructure count and raw score
+                candidate.update_infrastructure_count(infra_name, infra_count)
+                candidate.set_infrastructure_raw_score(infra_name, total_infra_score)
+                
+                # Update min/max for normalization
+                if total_infra_score > infra_score_ranges[infra_name]['max']:
+                    infra_score_ranges[infra_name]['max'] = total_infra_score
+                if total_infra_score < infra_score_ranges[infra_name]['min']:
+                    infra_score_ranges[infra_name]['min'] = total_infra_score
+
             # Update progress
-            feedback.setProgress(30 + int((i / len(infra_layers)) * 20))  # Use 30-50% for infrastructure
+            feedback.setProgress(30 + int((i / len(infra_layers)) * 20))
+
+        # Find global min/max scores across all infrastructure types
+        global_min_score = float('inf')
+        global_max_score = float('-inf')
         
+        # First pass: find global min/max across all raw scores
+        for candidate in candidates:
+            for infra_name in [self.safe_field_name(layer.name()) for layer in infra_layers]:
+                raw_score = candidate.infrastructures.get(infra_name, {}).get('raw_score', 0.0)
+                global_min_score = min(global_min_score, raw_score)
+                global_max_score = max(global_max_score, raw_score)
+                
+        feedback.pushInfo(f"Global score range for all infrastructures: {global_min_score} to {global_max_score}")
+
+        # Second pass: normalize scores using global min/max, then apply weights
+        if global_min_score == global_max_score:
+            feedback.pushInfo("All infrastructure scores are identical")
+            normalized_value = 1.0 if global_min_score > 0 else 0.0
+            
+            for candidate in candidates:
+                for infra_name, weight in zip([self.safe_field_name(layer.name()) for layer in infra_layers], infra_weights):
+                    # Pass both normalized score and weight
+                    candidate.set_infrastructure_score(infra_name, normalized_value, weight)
+                    feedback.pushInfo(f"Infrastructure {infra_name}: normalized={normalized_value:.4f}, weight={weight:.4f}, weighted={normalized_value * weight:.4f}")
+        else:
+            for candidate in candidates:
+                for infra_name, weight in zip([self.safe_field_name(layer.name()) for layer in infra_layers], infra_weights):
+                    raw_score = candidate.infrastructures.get(infra_name, {}).get('raw_score', 0.0)
+                    # Calculate normalized score
+                    normalized_score = (raw_score - global_min_score) / (global_max_score - global_min_score)
+                    # Pass both normalized score and weight
+                    candidate.set_infrastructure_score(infra_name, normalized_score, weight)
+                    feedback.pushInfo(f"Infrastructure {infra_name}: raw={raw_score:.4f}, normalized={normalized_score:.4f}, weight={weight:.4f}, weighted={normalized_score * weight:.4f}")
+
         # 3. PROCESS CENSUS DATA FOR EACH CANDIDATE
         feedback.pushInfo("Step 3: Evaluating candidates against census data...")
         
@@ -576,6 +739,7 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
         for infra_name, score_range in infra_score_ranges.items():
             min_score = score_range['min']
             max_score = score_range['max']
+            weight = infra_weights[[self.safe_field_name(layer.name()) for layer in infra_layers].index(infra_name)]
             
             # If all scores are the same, prevent division by zero
             if min_score == max_score:
@@ -589,14 +753,17 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
                 feedback.pushInfo(f"All {infra_name} scores identical ({min_score}), normalized to {normalized_value}")
                 
                 for candidate in candidates:
-                    candidate.set_infrastructure_score(infra_name, normalized_value)
+                    weighted_score = normalized_value * weight
+                    candidate.set_infrastructure_score(infra_name, weighted_score)
             else:
-                # Normal case: Apply normalization formula
+                # Normal case: Apply normalization formula and weight
                 for candidate in candidates:
-                    raw_score = candidate.infrastructures.get(infra_name, {}).get('score', 0.0)
-                    normalized_score = (raw_score - min_score) / (max_score - min_score)
-                    candidate.set_infrastructure_score(infra_name, normalized_score)
-        
+                    raw_score = candidate.infrastructures.get(infra_name, {}).get('raw_score', 0.0)
+                    normalized_value = (raw_score - min_score) / (max_score - min_score)
+                    weighted_score = normalized_value * weight
+                    candidate.set_infrastructure_score(infra_name, weighted_score)
+                    feedback.pushInfo(f"Infrastructure {infra_name}: raw={raw_score}, normalized={normalized_value:.4f}, weighted={weighted_score:.4f}")
+
         # Similar approach for census data
         # Ensure all candidates have entries for all census variables
         for variable in census_variables:
@@ -624,31 +791,55 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
             # If all values are the same, prevent division by zero
             if min_value == max_value:
                 if min_value == 0:
+                    # All values are zero, so normalized score is zero
                     normalized_value = 0.0
+                    weighted_score = 0.0
                 else:
-                    normalized_value = 1.0 if min_value > 0 else 0.0
+                    # All values are the same non-zero value, so they all get full score
+                    normalized_value = 1.0
+                    weighted_score = normalized_value  # Weight will be applied later
                 
-                weighted_score = normalized_value * weight
-                feedback.pushInfo(f"All {variable} values identical ({min_value}), normalized to {normalized_value}, weighted to {weighted_score}")
+                feedback.pushInfo(f"All {variable} values identical ({min_value}), normalized to {normalized_value}")
                 
                 for candidate in candidates:
-                    # Store the score in both locations
-                    candidate.census_scores[variable] = weighted_score 
-                    candidate.census_data[variable + "_score"] = weighted_score
-                    feedback.pushInfo(f"Set {variable} score for candidate to {weighted_score}")
+                    # First store the normalized (but unweighted) score
+                    candidate.census_data[variable + "_normalized"] = normalized_value
+                    # Now store the final score (which will be weighted globally later)
+                    candidate.census_scores[variable] = normalized_value
+                    feedback.pushInfo(f"Set {variable} normalized score for candidate to {normalized_value}")
             else:
-                # Normal case: Apply normalization and weighting
+                # Normal case: First normalize (0-1 scale)
                 for candidate in candidates:
                     value = candidate.census_data.get(variable, 0.0)
                     normalized_value = (value - min_value) / (max_value - min_value) if max_value > min_value else 0
-                    weighted_score = normalized_value * weight
                     
-                    # Store the score in both locations 
-                    candidate.census_scores[variable] = weighted_score
-                    candidate.census_data[variable + "_score"] = weighted_score
+                    # Store both the normalized value (unweighted) and the score
+                    candidate.census_data[variable + "_normalized"] = normalized_value
+                    candidate.census_scores[variable] = normalized_value
                     
-                    feedback.pushInfo(f"Census {variable}: raw={value}, norm={normalized_value:.4f}, weighted={weighted_score:.4f}")
+                    feedback.pushInfo(f"Census {variable}: raw={value}, normalized={normalized_value:.4f}")
 
+        # Now apply weights to the normalized census scores - this is done after normalizing all variables
+        # This makes the census scoring more similar to the infrastructure scoring
+        for candidate in candidates:
+            total_census_score = 0
+            for v, variable in enumerate(census_variables):
+                weight = census_weights[v]
+                normalized_value = candidate.census_scores[variable]
+                weighted_score = normalized_value * weight
+                
+                # Update the census score with the weighted value
+                candidate.census_scores[variable] = weighted_score
+                candidate.census_data[variable + "_score"] = weighted_score
+                
+                total_census_score += weighted_score
+                
+                feedback.pushInfo(f"Weighted census score for {variable}: {normalized_value:.4f} * {weight} = {weighted_score:.4f}")
+            
+            # Store the total census score for this candidate
+            candidate.total_census_score = total_census_score
+            feedback.pushInfo(f"Total census score for candidate: {total_census_score:.4f}")
+        
         # Create the output layer
         (sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT, context, buffer_fields, QgsWkbTypes.Polygon,
                                                candidate_layer.sourceCrs())
@@ -742,10 +933,10 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
                 infra_name = self.safe_field_name(infra_layer.name())
                 count = candidate.infrastructures.get(infra_name, {}).get('count', 0)
                 raw_score = candidate.infrastructures.get(infra_name, {}).get('raw_score', 0)
-                normalized_score = candidate.infrastructures.get(infra_name, {}).get('normalized_score', 0)
+                weighted_score = candidate.infrastructures.get(infra_name, {}).get('weighted_score', 0)
                 attributes.append(count)
                 attributes.append(raw_score)
-                attributes.append(normalized_score)
+                attributes.append(weighted_score)  # Use weighted_score instead of normalized_score
             
             # Add the total infrastructure score
             attributes.append(total_infra_score)

@@ -5,12 +5,15 @@ class Candidate:
         self.feature = feature
         self.feedback = feedback
         self.buffer = self.create_buffer(buffer_distance)
-        self.infrastructures = {}  # To store counts and scores per infrastructure type
-        self.census_data = {}  # To store census data values
-        self.census_scores = {}  # To store normalized census scores
-        self.critical_zones = {}  # To store critical zone scores and penalties
+        # Initialize infrastructure dictionary with all required score types
+        self.infrastructures = {}  # Format: {'infra_name': {'count': 0, 'raw_score': 0, 'normalized_score': 0, 'weighted_score': 0}}
+        self.census_data = {}
+        self.census_scores = {}
+        self.critical_zones = {}
         self.final_score = 0
         self.total_census_score = 0
+        self.total_infra_score = 0
+        self.total_zone_score = 0
         
     def create_buffer(self, buffer_distance):
         # Log buffer creation information
@@ -66,19 +69,47 @@ class Candidate:
     def update_infrastructure_count(self, infra_name, count=0):
         """Update the count of infrastructure items of a given type."""
         if infra_name not in self.infrastructures:
-            self.infrastructures[infra_name] = {'count': 0, 'raw_score': 0, 'normalized_score': 0}
+            self.infrastructures[infra_name] = {
+                'count': 0,
+                'raw_score': 0,
+                'normalized_score': 0,
+                'weighted_score': 0
+            }
         self.infrastructures[infra_name]['count'] = count
         
-    def set_infrastructure_score(self, infra_name, normalized_score):
-        """Set the normalized score for an infrastructure type."""
+    def set_infrastructure_score(self, infra_name, normalized_score, weight=None):
+        """Set the normalized and weighted scores for an infrastructure type.
+        
+        Args:
+            infra_name (str): Name of the infrastructure
+            normalized_score (float): The normalized score (0-1)
+            weight (float, optional): The weight to apply. If None, only normalized score is updated.
+        """
         if infra_name not in self.infrastructures:
-            self.infrastructures[infra_name] = {'count': 0, 'raw_score': 0, 'normalized_score': 0}
+            self.infrastructures[infra_name] = {
+                'count': 0,
+                'raw_score': 0,
+                'normalized_score': 0,
+                'weighted_score': 0
+            }
+        
+        # Set normalized score
         self.infrastructures[infra_name]['normalized_score'] = normalized_score
+        
+        # Calculate and set weighted score if weight is provided
+        if weight is not None:
+            weighted_score = normalized_score * weight
+            self.infrastructures[infra_name]['weighted_score'] = weighted_score
         
     def set_infrastructure_raw_score(self, infra_name, raw_score):
         """Set the raw (unweighted) score for an infrastructure type."""
         if infra_name not in self.infrastructures:
-            self.infrastructures[infra_name] = {'count': 0, 'raw_score': 0, 'normalized_score': 0}
+            self.infrastructures[infra_name] = {
+                'count': 0,
+                'raw_score': 0,
+                'normalized_score': 0,
+                'weighted_score': 0
+            }
         self.infrastructures[infra_name]['raw_score'] = raw_score
             
     def set_census_data_score(self, variable, score):
@@ -93,14 +124,17 @@ class Candidate:
         
     def calculate_final_score(self):
         """Calculate the final score combining all components"""
-        # Sum up all the individual scores from infrastructures, census data, and critical zones
-        infrastructure_score = sum(info['normalized_score'] for info in self.infrastructures.values())
+        # Calculate infrastructure score using weighted scores
+        infrastructure_score = sum(info.get('weighted_score', 0) for info in self.infrastructures.values())
+        self.total_infra_score = infrastructure_score
         
-        # Sum census data scores - use the census_scores dict
+        # Sum census data scores
         census_score = sum(self.census_scores.values())
+        self.total_census_score = census_score
         
         # Sum critical zone scores
         critical_zone_score = sum(self.critical_zones.values())
+        self.total_zone_score = critical_zone_score
         
         # Calculate final score
         self.final_score = infrastructure_score + census_score + critical_zone_score
@@ -111,7 +145,7 @@ class Candidate:
         # Generate a list of attributes for the output feature
         attributes = [self.feature['id'], self.feature['name']]
         for infra_type, info in self.infrastructures.items():
-            attributes.extend([info['count'], info['raw_score'], info['normalized_score']])
+            attributes.extend([info['count'], info['raw_score'], info['score']])
         for variable, value in self.census_data.items():
             if not variable.endswith("_score"):  # Only include raw values
                 attributes.append(value)
