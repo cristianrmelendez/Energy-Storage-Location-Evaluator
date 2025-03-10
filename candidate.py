@@ -6,10 +6,10 @@ class Candidate:
         self.feedback = feedback
         self.buffer = self.create_buffer(buffer_distance)
         self.infrastructures = {}  # To store counts and scores per infrastructure type
-        self.census_data = {}  # To store census data scores
+        self.census_data = {}  # To store census data values
+        self.census_scores = {}  # To store normalized census scores
         self.critical_zones = {}  # To store critical zone scores and penalties
         self.final_score = 0
-        self.census_scores = {}
         self.total_census_score = 0
         
     def create_buffer(self, buffer_distance):
@@ -82,18 +82,22 @@ class Candidate:
         self.infrastructures[infra_name]['raw_score'] = raw_score
             
     def set_census_data_score(self, variable, score):
-        # Store the score in a way that's distinct from the raw value
+        """Set a normalized score for a census variable"""
+        # Store in both places for backward compatibility during transition
         self.census_data[variable + "_score"] = score
+        self.census_scores[variable] = score
         
     def set_critical_zone_score(self, zone_type, score):
+        """Set score for a critical zone"""
         self.critical_zones[zone_type] = score
         
     def calculate_final_score(self):
+        """Calculate the final score combining all components"""
         # Sum up all the individual scores from infrastructures, census data, and critical zones
         infrastructure_score = sum(info['normalized_score'] for info in self.infrastructures.values())
         
-        # Sum census data scores (they have "_score" suffix)
-        census_score = sum(score for key, score in self.census_data.items() if key.endswith("_score"))
+        # Sum census data scores - use the census_scores dict
+        census_score = sum(self.census_scores.values())
         
         # Sum critical zone scores
         critical_zone_score = sum(self.critical_zones.values())
@@ -108,37 +112,32 @@ class Candidate:
         attributes = [self.feature['id'], self.feature['name']]
         for infra_type, info in self.infrastructures.items():
             attributes.extend([info['count'], info['raw_score'], info['normalized_score']])
-        for variable, score in self.census_data.items():
-            attributes.append(score)
+        for variable, value in self.census_data.items():
+            if not variable.endswith("_score"):  # Only include raw values
+                attributes.append(value)
+                score = self.census_scores.get(variable, 0)
+                attributes.append(score)
         for zone_type, score in self.critical_zones.items():
             attributes.append(score)
         attributes.append(self.final_score)
         return attributes
-
+        
     def set_census_data(self, variable_name, value):
         """Set a census data value for a given variable"""
         self.census_data[variable_name] = value
 
-    def set_census_data_score(self, variable_name, score):
-        """Set a normalized score for a census variable"""
-        self.census_scores[variable_name] = score
-
-    def get_census_data_score(self, variable_name):
-        """Get the normalized score for a census variable"""
-        return self.census_scores.get(variable_name, 0)
-
     def calculate_total_census_score(self):
-        """Calculate the total census score as average of all normalized scores"""
+        """Calculate the total census score as sum of all normalized scores"""
         if self.census_scores:
-            self.total_census_score = sum(self.census_scores.values()) / len(self.census_scores)
+            self.total_census_score = sum(self.census_scores.values())
         else:
             self.total_census_score = 0
         return self.total_census_score
-
+        
     def get_census_data(self, variable_name):
         """Get raw census data for a variable"""
         return self.census_data.get(variable_name, 0)
-
+        
     def get_census_score(self, variable_name):
         """Get normalized score for a census variable"""
         return self.census_scores.get(variable_name, 0)
