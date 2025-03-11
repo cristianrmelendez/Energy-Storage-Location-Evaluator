@@ -2,11 +2,31 @@ from qgis.core import QgsGeometry, QgsProject, QgsCoordinateReferenceSystem, Qgs
 
 class Candidate:
     def __init__(self, feature, buffer_distance, feedback=None):
+        """Initialize the candidate with its feature and buffer."""
         self.feature = feature
         self.feedback = feedback
+        
+        # Store the ID immediately for consistent access
+        self.id = feature.id()  # Use native feature ID
+        
+        # Check all possible ID field variations
+        if 'Id' in feature.fields().names():
+            self.field_id = feature['Id']
+        elif 'ID' in feature.fields().names():
+            self.field_id = feature['ID']
+        elif 'id' in feature.fields().names():
+            self.field_id = feature['id']
+        else:
+            self.field_id = self.id
+            
+        # Log ID assignment for debugging
+        if self.feedback:
+            self.feedback.pushInfo(f"Initializing candidate with ID: {self.id} (field ID: {self.field_id})")
+        
         self.buffer = self.create_buffer(buffer_distance)
-        # Initialize infrastructure dictionary with all required score types
-        self.infrastructures = {}  # Format: {'infra_name': {'count': 0, 'raw_score': 0, 'normalized_score': 0, 'weighted_score': 0}}
+        
+        # Initialize other attributes
+        self.infrastructures = {}
         self.census_data = {}
         self.census_scores = {}
         self.critical_zones = {}
@@ -19,7 +39,7 @@ class Candidate:
         # Log buffer creation information
         if self.feedback:
             feature_id = self.feature['id'] if 'id' in self.feature.fields().names() else 'unknown'
-            self.feedback.pushInfo(f"Creating buffer for candidate {feature_id} with distance {buffer_distance:.2f} meters")
+            self.feedback.pushInfo(f"Creating buffer for candidate {self.field_id} with distance {buffer_distance:.2f} meters")
             
         # Get the feature's geometry
         geom = self.feature.geometry()
@@ -77,13 +97,14 @@ class Candidate:
             }
         self.infrastructures[infra_name]['count'] = count
         
-    def set_infrastructure_score(self, infra_name, normalized_score, weight=None):
-        """Set the normalized and weighted scores for an infrastructure type.
+    def set_infrastructure_score(self, infra_name, normalized_score, weighted_score=None):
+        """
+        Set both normalized and weighted scores for an infrastructure type.
         
         Args:
             infra_name (str): Name of the infrastructure
             normalized_score (float): The normalized score (0-1)
-            weight (float, optional): The weight to apply. If None, only normalized score is updated.
+            weighted_score (float, optional): The weighted score. If None, only normalized score is updated.
         """
         if infra_name not in self.infrastructures:
             self.infrastructures[infra_name] = {
@@ -93,12 +114,9 @@ class Candidate:
                 'weighted_score': 0
             }
         
-        # Set normalized score
         self.infrastructures[infra_name]['normalized_score'] = normalized_score
         
-        # Calculate and set weighted score if weight is provided
-        if weight is not None:
-            weighted_score = normalized_score * weight
+        if weighted_score is not None:
             self.infrastructures[infra_name]['weighted_score'] = weighted_score
         
     def set_infrastructure_raw_score(self, infra_name, raw_score):
@@ -112,23 +130,31 @@ class Candidate:
             }
         self.infrastructures[infra_name]['raw_score'] = raw_score
             
-    def set_census_data_score(self, variable, score):
-        """Set a normalized score for a census variable"""
+    def set_census_data_score(self, variable, weighted_score):
+        """
+        Set a weighted normalized score for a census variable.
+        In the new unified system, census scores are weighted as part of the total score.
+        """
         # Store in both places for backward compatibility during transition
-        self.census_data[variable + "_score"] = score
-        self.census_scores[variable] = score
+        self.census_data[variable + "_score"] = weighted_score
+        self.census_scores[variable] = weighted_score
         
     def set_critical_zone_score(self, zone_type, score):
-        """Set score for a critical zone"""
+        """Set score for a critical zone. These are direct modifiers."""
         self.critical_zones[zone_type] = score
         
     def calculate_final_score(self):
-        """Calculate the final score combining all components"""
+        """
+        Calculate the final score using the new unified scoring system.
+        Infrastructure and census scores use unified weighting,
+        while critical zone scores are direct modifiers.
+        """
         # Calculate infrastructure score using weighted scores
-        infrastructure_score = sum(info.get('weighted_score', 0) for info in self.infrastructures.values())
+        infrastructure_score = sum(info.get('weighted_score', 0) 
+                                 for info in self.infrastructures.values())
         self.total_infra_score = infrastructure_score
         
-        # Sum census data scores
+        # Sum census data scores (which are already weighted)
         census_score = sum(self.census_scores.values())
         self.total_census_score = census_score
         
@@ -136,7 +162,7 @@ class Candidate:
         critical_zone_score = sum(self.critical_zones.values())
         self.total_zone_score = critical_zone_score
         
-        # Calculate final score
+        # Calculate final score: (weighted scores) + (zone modifiers)
         self.final_score = infrastructure_score + census_score + critical_zone_score
         
         return self.final_score
