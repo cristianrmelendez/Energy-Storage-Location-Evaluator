@@ -91,6 +91,7 @@ class StaticEnergyStorageEvaluator:
     def evaluate_infrastructure(self, candidate, infra_layers, infra_weights, buffer_distance, distance_method):
         """
         Evaluate a candidate against infrastructure layers using the specified distance method.
+        Also gather outage costs for infrastructure features within the buffer.
         """
         for i, layer in enumerate(infra_layers):
             infra_name = layer.name()
@@ -106,6 +107,7 @@ class StaticEnergyStorageEvaluator:
                     start_point = candidate.feature.geometry().asPoint()
                     end_point = feature.geometry().asPoint()
                     
+                    # Calculate distance based on method
                     if distance_method == 0:  # Road distance
                         try:
                             distance = self.road_analyzer.calculate_road_distance(
@@ -114,12 +116,39 @@ class StaticEnergyStorageEvaluator:
                             )
                         except Exception as e:
                             self.log(f"Road distance calculation failed: {str(e)}, using Haversine")
-                            distance = candidate.feature.geometry().distance(feature.geometry())
+                            # Transform coordinates to get lon/lat
+                            start_lon, start_lat = self.road_analyzer.transform_coordinates(
+                                start_point.x(), start_point.y()
+                            )
+                            end_lon, end_lat = self.road_analyzer.transform_coordinates(
+                                end_point.x(), end_point.y()
+                            )
+                            distance = self.road_analyzer.haversine_distance(
+                                start_lon, start_lat, end_lon, end_lat
+                            )
                     else:  # Haversine distance
-                        distance = candidate.feature.geometry().distance(feature.geometry())
+                        # Transform coordinates to get lon/lat for haversine calculation
+                        start_lon, start_lat = self.road_analyzer.transform_coordinates(
+                            start_point.x(), start_point.y()
+                        )
+                        end_lon, end_lat = self.road_analyzer.transform_coordinates(
+                            end_point.x(), end_point.y()
+                        )
+                        distance = self.road_analyzer.haversine_distance(
+                            start_lon, start_lat, end_lon, end_lat
+                        )
                     
                     # Score formula: buffer_distance - actual_distance
                     score = max(0, buffer_distance - distance)
+                    
+                    # Only include outage cost if this infrastructure contributes to the score
+                    if score > 0:
+                        # Get outage cost if it exists in the feature
+                        if 'outage_cos' in feature.fields().names():
+                            outage_cost = feature['outage_cos']
+                            self.log(f"Found outage_cos in feature: {outage_cost} (contributes to score)")
+                            candidate.add_infrastructure_outage_cost(infra_name, outage_cost)
+                    
                     total_score += score
             
             # Update candidate with counts and raw scores
@@ -208,5 +237,8 @@ class StaticEnergyStorageEvaluator:
             final_score = (infra_total + census_total) + zone_total
             candidate.final_score = final_score
             
+            # Calculate outage cost savings
+            outage_savings = candidate.calculate_total_outage_cost_savings()
+            
             self.log(f"Candidate scores: infra={infra_total:.4f}, census={census_total:.4f}, "
-                    f"zones={zone_total:.4f}, final={final_score:.4f}")
+                    f"zones={zone_total:.4f}, final={final_score:.4f}, outage_savings=${outage_savings:.2f}")

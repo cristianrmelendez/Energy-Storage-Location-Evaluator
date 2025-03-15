@@ -223,7 +223,11 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
             buffer_fields.append(QgsField(f'{infra_name}_Count', QVariant.Int))
             buffer_fields.append(QgsField(f'{infra_name}_Raw_Score', QVariant.Double))
             buffer_fields.append(QgsField(f'{infra_name}_Normalized_Score', QVariant.Double))
+            # Add field for outage costs per infrastructure type
+            buffer_fields.append(QgsField(f'{infra_name}_Outage_Cost_Savings', QVariant.Double))
         buffer_fields.append(QgsField('Total_Infrastructure_Score', QVariant.Double))
+        # Add field for total outage cost savings
+        buffer_fields.append(QgsField('Total_Outage_Cost_Savings', QVariant.Double))
         return buffer_fields
 
     def _add_census_fields(self, buffer_fields, census_layer):
@@ -352,29 +356,60 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
             buffer_fields, QgsWkbTypes.Polygon, candidate_layer.sourceCrs()
         )
 
+        feedback.pushInfo(f"Created output sink with {len(buffer_fields)} fields")
+        
         # Write results to output layer
         for candidate in candidates:
             if feedback.isCanceled():
                 break
 
+            # Debug buffer geometry
+            if not candidate.buffer.isGeosValid():
+                feedback.pushWarning(f"Invalid buffer geometry for candidate {candidate.id}")
+                continue
+                
+            feedback.pushInfo(f"Processing candidate {candidate.id} with buffer area: {candidate.buffer.area()}")
+
             feature = QgsFeature(buffer_fields)
             feature.setGeometry(candidate.buffer)
 
-            # Build attributes list
-            # Get id using proper feature method and check for all ID field variations
-            feature_id = candidate.feature.id()
+            # Get proper ID for the feature, first try to use the Id field if present
+            # Otherwise fall back to the feature's internal ID
+            feature_id = candidate.id  # Default to candidate's internal ID
+            
             try:
-                # Try to get name, checking all possible ID field variations
+                # Check for 'Id' field first (capital I, lowercase d)
                 if 'Id' in candidate.feature.fields().names():
-                    feature_name = str(candidate.feature['Id'])
+                    feature_id = candidate.feature['Id']
+                    feedback.pushInfo(f"Using 'Id' field value: {feature_id}")
+                # Only fall back to these if 'Id' is not found
                 elif 'ID' in candidate.feature.fields().names():
-                    feature_name = str(candidate.feature['ID'])
+                    feature_id = candidate.feature['ID']
+                    feedback.pushInfo(f"Using 'ID' field value: {feature_id}")
                 elif 'id' in candidate.feature.fields().names():
-                    feature_name = str(candidate.feature['id'])
-                else:
-                    feature_name = f'Candidate {feature_id}'
+                    feature_id = candidate.feature['id']
+                    feedback.pushInfo(f"Using 'id' field value: {feature_id}")
             except KeyError:
+                feedback.pushInfo(f"No Id field found, using internal ID: {feature_id}")
+            
+            # Get proper Name for the feature
+            feature_name = None
+            try:
+                # First check for 'Name' with capital N
+                if 'Name' in candidate.feature.fields().names():
+                    feature_name = str(candidate.feature['Name'])
+                    feedback.pushInfo(f"Using 'Name' field value: {feature_name}")
+                # Then check for lowercase 'name'
+                elif 'name' in candidate.feature.fields().names():
+                    feature_name = str(candidate.feature['name'])
+                    feedback.pushInfo(f"Using 'name' field value: {feature_name}")
+            except KeyError:
+                pass
+                
+            # If no name was found, use Id as the name
+            if not feature_name:
                 feature_name = f'Candidate {feature_id}'
+                feedback.pushInfo(f"No Name field found, using ID as name: {feature_name}")
             
             attrs = [feature_id, feature_name]
 
@@ -382,13 +417,22 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
             for layer in infra_layers:
                 name = layer.name()
                 info = candidate.infrastructures.get(name, {})
+                
+                # Get outage cost total for this infrastructure type
+                outage_costs = candidate.outage_costs.get(name, [])
+                outage_cost_total = sum(outage_costs)
+                
                 attrs.extend([
                     info.get('count', 0),
                     info.get('raw_score', 0),
-                    info.get('weighted_score', 0)
+                    info.get('normalized_score', 0),  # Changed from 'weighted_score' to match field name
+                    outage_cost_total  
                 ])
+            
+            # Add total scores
             attrs.append(candidate.total_infra_score)
-
+            attrs.append(candidate.total_outage_cost_savings)
+            
             # Add census attributes
             for var in census_variables:
                 attrs.extend([
@@ -407,8 +451,22 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
                 candidate.final_score
             ])
 
+            # Debug attribute count vs field count
+            if len(attrs) != len(buffer_fields):
+                feedback.pushWarning(f"Attribute count ({len(attrs)}) doesn't match field count ({len(buffer_fields)})")
+                feedback.pushInfo(f"Fields: {[field.name() for field in buffer_fields]}")
+                feedback.pushInfo(f"First 10 attributes: {attrs[:10]}")
+                continue
+                
             feature.setAttributes(attrs)
-            sink.addFeature(feature, QgsFeatureSink.FastInsert)
+            
+            # Check if feature is valid before adding
+            if not feature.isValid():
+                feedback.pushWarning(f"Invalid feature created for candidate {candidate.id}")
+                continue
+                
+            result = sink.addFeature(feature, QgsFeatureSink.FastInsert)
+            feedback.pushInfo(f"Added feature for candidate {candidate.id}: {'Success' if result else 'Failed'}")
 
             feedback.setProgress(80 + int((candidates.index(candidate) / len(candidates)) * 20))
 

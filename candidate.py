@@ -35,6 +35,10 @@ class Candidate:
         self.total_infra_score = 0
         self.total_zone_score = 0
         
+        # Initialize outage cost tracking
+        self.outage_costs = {}
+        self.total_outage_cost_savings = 0
+        
     def create_buffer(self, buffer_distance):
         # Log buffer creation information
         if self.feedback:
@@ -93,9 +97,46 @@ class Candidate:
                 'count': 0,
                 'raw_score': 0,
                 'normalized_score': 0,
-                'weighted_score': 0
+                'weighted_score': 0,
+                'outage_costs': []  # Add a list to track outage costs for this infra type
             }
         self.infrastructures[infra_name]['count'] = count
+    
+    def add_infrastructure_outage_cost(self, infra_name, outage_cost):
+        """Add outage cost for a specific infrastructure item."""
+        if infra_name not in self.outage_costs:
+            self.outage_costs[infra_name] = []
+            
+        if outage_cost is not None and outage_cost != "NULL":
+            try:
+                cost = float(outage_cost)
+                self.outage_costs[infra_name].append(cost)
+                
+                # Also store in infrastructure dict for consistency
+                if infra_name not in self.infrastructures:
+                    self.update_infrastructure_count(infra_name)
+                if 'outage_costs' not in self.infrastructures[infra_name]:
+                    self.infrastructures[infra_name]['outage_costs'] = []
+                    
+                self.infrastructures[infra_name]['outage_costs'].append(cost)
+                
+                if self.feedback:
+                    self.feedback.pushInfo(f"Added outage cost {cost} for {infra_name}")
+            except (ValueError, TypeError):
+                if self.feedback:
+                    self.feedback.pushInfo(f"Invalid outage cost value: {outage_cost}")
+    
+    def calculate_total_outage_cost_savings(self):
+        """Calculate the total outage cost savings from all infrastructure types."""
+        total = 0
+        for infra_name, costs in self.outage_costs.items():
+            # Only count costs if this infrastructure contributes to the score
+            infra_score = self.infrastructures.get(infra_name, {}).get('weighted_score', 0)
+            if infra_score > 0:
+                total += sum(costs)
+        
+        self.total_outage_cost_savings = total
+        return total
         
     def set_infrastructure_score(self, infra_name, normalized_score, weighted_score=None):
         """
@@ -111,7 +152,8 @@ class Candidate:
                 'count': 0,
                 'raw_score': 0,
                 'normalized_score': 0,
-                'weighted_score': 0
+                'weighted_score': 0,
+                'outage_costs': []  # Initialize outage costs list
             }
         
         self.infrastructures[infra_name]['normalized_score'] = normalized_score
@@ -170,8 +212,20 @@ class Candidate:
     def generate_output_attributes(self):
         # Generate a list of attributes for the output feature
         attributes = [self.feature['id'], self.feature['name']]
+        
+        # Add infrastructure attributes
         for infra_type, info in self.infrastructures.items():
             attributes.extend([info['count'], info['raw_score'], info['score']])
+            
+            # Add outage costs if available
+            outage_costs = self.outage_costs.get(infra_type, [])
+            total_type_cost = sum(outage_costs)
+            attributes.append(total_type_cost)
+        
+        # Add total outage cost savings
+        attributes.append(self.calculate_total_outage_cost_savings())
+        
+        # Add remaining attributes
         for variable, value in self.census_data.items():
             if not variable.endswith("_score"):  # Only include raw values
                 attributes.append(value)
@@ -180,6 +234,7 @@ class Candidate:
         for zone_type, score in self.critical_zones.items():
             attributes.append(score)
         attributes.append(self.final_score)
+        
         return attributes
         
     def set_census_data(self, variable_name, value):

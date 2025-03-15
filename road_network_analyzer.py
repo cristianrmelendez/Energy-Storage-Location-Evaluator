@@ -1,4 +1,5 @@
 import requests
+import numpy as np
 from qgis.core import QgsCoordinateTransform, QgsProject, QgsPointXY, QgsCoordinateReferenceSystem
 
 class RoadNetworkAnalyzer:
@@ -60,3 +61,18 @@ class RoadNetworkAnalyzer:
         """
         route_info = self.get_route_info(start_lon, start_lat, end_lon, end_lat)
         return route_info['duration']  # Duration in seconds
+
+    def haversine_distance(self, lon1, lat1, lon2, lat2):
+        """
+        Calculate the great circle distance between two points 
+        on the earth (specified in decimal degrees).
+        Returns distance in kilometers.
+        """
+        r = 6371  # Radius of earth in kilometers
+        phi1 = np.radians(lat1)
+        phi2 = np.radians(lat2)
+        delta_phi = np.radians(lat2 - lat1)
+        delta_lambda = np.radians(lon2 - lon1)
+        a = np.sin(delta_phi / 2)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(delta_lambda / 2)**2
+        res = r * (2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a)))
+        return np.round(res * 1000, 2)  # Convert to meters for consistency
