@@ -162,7 +162,7 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterString(
                 self.INFRASTRUCTURE_WEIGHTS,
                 self.tr('Enter the weights for each infrastructure layer (comma-separated)'
-                        ' in the same order as the layers. Must sum to 1.0.'),
+                        ' in the same order as the layers.'),
                 defaultValue='0.25,0.25,0.25,0.25'  # Example default value for 4 layers
             )
         )
