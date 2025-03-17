@@ -1,9 +1,55 @@
 <html>
 <body>
-<h3>Plugin Builder Results</h3>
+<h1>Energy Storage Location Evaluator</h1>
 
-Congratulations! You just built a plugin for QGIS!<br/><br />
+<h2>Overview</h2>
+<p>
+The Energy Storage Location Evaluator is a QGIS plugin that helps users evaluate potential locations for energy storage systems. It supports both static and mobile energy storage configurations, providing a comprehensive analysis based on proximity to critical infrastructure, demographic data, and critical zones.
+</p>
 
+<h2>Features</h2>
+<ul>
+  <li><strong>Static Energy Storage Model</strong>: Evaluates fixed installation sites using buffer zones around candidate locations</li>
+  <li><strong>Mobile Energy Storage Model</strong>: Evaluates mobile deployment strategies considering coverage areas and travel times</li>
+  <li><strong>Multiple Assessment Criteria</strong>:
+    <ul>
+      <li>Proximity to critical infrastructure (hospitals, schools, emergency services, etc.)</li>
+      <li>Demographic considerations from census data</li>
+      <li>Critical zones (favorable or unfavorable areas)</li>
+      <li>Economic analysis through outage cost savings</li>
+    </ul>
+  </li>
+</ul>
+
+<h2>Technical Implementation</h2>
+<p>
+The plugin implements two distinct evaluation models:
+</p>
+
+<h3>1. Static Energy Storage Systems Model</h3>
+<p>
+Used for evaluating fixed installation sites. Key components include:
+</p>
+<ul>
+  <li><strong>Buffer Analysis</strong>: Creates service areas around each candidate location</li>
+  <li><strong>Infrastructure Proximity Scoring</strong>: Evaluates proximity to critical infrastructures</li>
+  <li><strong>Demographic Analysis</strong>: Considers population density and other census data</li>
+  <li><strong>Critical Zone Assessment</strong>: Evaluates location suitability based on environmental and regulatory factors</li>
+  <li><strong>Economic Analysis</strong>: Calculates potential outage cost savings</li>
+</ul>
+
+<h3>2. Mobile Energy Storage Systems Model</h3>
+<p>
+Used for evaluating mobile deployment strategies. Key components include:
+</p>
+<ul>
+  <li><strong>Coverage Area Analysis</strong>: Evaluates service areas for mobile units</li>
+  <li><strong>Travel Time Calculations</strong>: Estimates response times to critical infrastructure</li>
+  <li><strong>Infrastructure Prioritization</strong>: Ranks infrastructure based on criticality</li>
+  <li><strong>Dynamic Deployment Strategies</strong>: Evaluates different deployment scenarios</li>
+</ul>
+
+<h2>Installation</h2>
 <div id='help' style='font-size:.9em;'>
 Your plugin <b>EnergyStorageLocationEvaluator</b> was created in:<br>
 &nbsp;&nbsp;<b>/Users/cristianmelendez/Library/Application Support/QGIS/QGIS3/profiles/default/python/plugins/energy_storage_location_evaluator</b>
@@ -11,27 +57,102 @@ Your plugin <b>EnergyStorageLocationEvaluator</b> was created in:<br>
 Your QGIS plugin directory is located at:<br>
 &nbsp;&nbsp;<b>/Users/cristianmelendez/Library/Application Support/QGIS/QGIS3/profiles/default/python/plugins</b>
 <p>
+<ol>
+    <li>Copy the entire directory containing your new plugin to the QGIS plugin directory</li>
+    <li>Enable the plugin in the QGIS plugin manager</li>
+    <li>The tool will be available in the Processing Toolbox under "Energy Storage Evaluation"</li>
+</ol>
+</div>
+
+<h2>Usage Guide</h2>
+<ol>
+    <li>Open QGIS and enable the plugin</li>
+    <li>Access the tool from the Processing Toolbox under "Energy Storage Evaluation"</li>
+    <li>Select the appropriate model (Static or Mobile)</li>
+    <li>Provide the required input layers:
+        <ul>
+            <li>Candidates layer (point locations)</li>
+            <li>Critical infrastructure layers (points)</li>
+            <li>Census data layer (polygons)</li>
+            <li>Critical zones layers (polygons)</li>
+            <li>For Static Model: Buffer distance and distance calculation method</li>
+            <li>For Mobile Model: Coverage area polygon</li>
+        </ul>
+    </li>
+    <li>Configure weights and scores
+        <ul>
+            <li>Infrastructure weights (e.g., 0.25,0.25,0.25,0.25)</li>
+            <li>Census data weights (e.g., 0.25,0.25,0.25,0.25)</li>
+            <li>Critical zone scores (e.g., 10,-5,-10)</li>
+            <li>Note: All weights must sum to 1.0</li>
+        </ul>
+    </li>
+    <li>Run the analysis</li>
+    <li>The output layer will contain all scores and evaluations for each candidate location</li>
+</ol>
+
+<h2>Road Network Analysis</h2>
+<p>
+For distance calculations, the plugin can use either:
+</p>
+<ul>
+    <li>Straight-line distance (Haversine)</li>
+    <li>Road network distance (requires OSRM server)</li>
+</ul>
+
+<h3>OSRM Setup (Important!)</h3>
+<p>
+When using road network analysis, please note:
+</p>
+<ul>
+    <li>The plugin expects OSRM to be listening on port 5001 (<code>http://127.0.0.1:5001</code>)</li>
+    <li><strong>It is the user's responsibility</strong> to set up and configure the OSRM server correctly</li>
+    <li>You must provide appropriate mapping files (<code>.osm.pbf</code>) for the specific geographic area where your evaluation is taking place</li>
+    <li>Road network distance calculations will fail if OSRM is not properly configured with the correct maps</li>
+</ul>
+
+<p>
+To set up OSRM:
+</p>
+<ol>
+    <li>Download OSRM from <a href="http://project-osrm.org/">http://project-osrm.org/</a></li>
+    <li>Download the appropriate <code>.osm.pbf</code> file for your region from <a href="https://download.geofabrik.de/">https://download.geofabrik.de/</a></li>
+    <li>Process the map files according to <a href="https://github.com/Project-OSRM/osrm-backend/wiki/Running-OSRM">OSRM documentation</a></li>
+    <li>Start the OSRM server on port 5001 (or modify the port in the <code>road_network_analyzer.py</code> file)</li>
+</ol>
+
+<p>
+If you cannot set up OSRM, the plugin will fall back to using straight-line (Haversine) distance calculations.
+</p>
+
+<h2>Output Interpretation</h2>
+<p>
+The output layer contains detailed scoring information:
+</p>
+<ul>
+    <li><strong>Infrastructure Scores</strong>: Raw and weighted scores for each infrastructure type</li>
+    <li><strong>Census Data Scores</strong>: Raw values and weighted scores for demographic variables</li>
+    <li><strong>Zone Scores</strong>: Direct modifiers from critical zones</li>
+    <li><strong>Total Scores</strong>: Component scores (infrastructure, census, zones) and final combined score</li>
+    <li><strong>Economic Metrics</strong>: Outage cost savings (static model only)</li>
+</ul>
+
 <h3>What's Next</h3>
 <ol>
     <li>Test the generated sources using <b>make test</b> (or run tests from your IDE)
-    <li>Copy the entire directory containing your new plugin to the QGIS plugin directory (see Notes below)
-    <li>Test the plugin by enabling it in the QGIS plugin manager and enabling the provider in the Processing Options
     <li>Customize it by editing the implementation file <b>energy_storage_location_evaluator_algorithm.py</b>
 </ol>
-Notes:
-<ul>
-    <li>You can use the <b>Makefile</b> to compile and deploy when you
-        make changes. This requires GNU make (gmake). The Makefile is ready to use, however you 
-        will have to edit it to add addional Python source files, dialogs, and translations.
-    <li>You can also use <b>pb_tool</b> to compile and deploy your plugin. Tweak the <i>pb_tool.cfg</i> file included with your plugin as you add files. Install <b>pb_tool</b> using 
-        <i>pip</i> or <i>easy_install</i>. See <b>http://loc8.cc/pb_tool</b> for more information.
-</ul>
-</div>
+
 <div style='font-size:.9em;'>
 <p>
-For information on writing PyQGIS code, see <b>http://loc8.cc/pyqgis_resources</b> for a list of resources.
+For information on writing PyQGIS code, see <a href="http://loc8.cc/pyqgis_resources">http://loc8.cc/pyqgis_resources</a> for a list of resources.
+</p>
+<p>
+For more information about the plugin architecture, see the PyQGIS Developer Cookbook at:
+<a href="http://www.qgis.org/pyqgis-cookbook/index.html">http://www.qgis.org/pyqgis-cookbook/index.html</a>
 </p>
 </div>
+
 <p>
 &copy;2011-2018 GeoApt LLC - geoapt.com 
 </p>

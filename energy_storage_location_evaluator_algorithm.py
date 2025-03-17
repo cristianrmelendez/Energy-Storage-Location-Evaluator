@@ -55,13 +55,25 @@ from qgis.core import (QgsProcessing,
                        QgsRectangle
                        )
 
-from .candidate import Candidate
+# Import both candidate classes - each model has its own dedicated candidate class
+from .mobile_candidate import Candidate as MobileCandidate
+from .static_candidate import Candidate as StaticCandidate
 from .static_model import StaticEnergyStorageEvaluator
+from .mobile_model import MobileEnergyStorageEvaluator
 
 
 class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
+    """
+    This algorithm evaluates potential locations for energy storage systems.
+    It supports two distinct models:
+    1. Static Energy Storage (section 3.2): Uses buffer zones around each candidate
+    2. Mobile Energy Storage (section 3.3): Uses a coverage area and travel times
+    
+    The algorithm automatically selects the appropriate model based on user input
+    and handles parameter validation, data processing, and scoring accordingly.
+    """
 
-    # Inputs
+    # Input parameters
     EVALUATION_TYPE = 'EVALUATION_TYPE'
     DISTANCE_METHOD = 'DISTANCE_METHOD'
     CANDIDATES_LAYER = 'CANDIDATES_LAYER'
@@ -72,12 +84,20 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
     CENSUS_DATA_WEIGHTS = 'CENSUS_DATA_WEIGHTS'
     CRITICAL_ZONES = 'CRITICAL_ZONES'
     CRITICAL_ZONE_SCORES = 'CRITICAL_ZONE_SCORES'
-
-    # Outputs
+    COVERAGE_AREA = 'COVERAGE_AREA'  # Used only for mobile model
+    
+    # Output parameter
     OUTPUT = 'OUTPUT'
 
     def initAlgorithm(self, config=None):
-
+        """
+        Define the inputs and outputs of the algorithm.
+        
+        This method sets up the parameters needed for both static and mobile
+        energy storage evaluation models. Some parameters are specific to
+        one model or the other.
+        """
+        # Evaluation Type - determines which model to use
         self.addParameter(
             QgsProcessingParameterEnum(
                 self.EVALUATION_TYPE,
@@ -87,16 +107,28 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        # Coverage Area - only required for Mobile Energy Storage (section 3.3.2.2)
+        self.addParameter(
+            QgsProcessingParameterFeatureSource(
+                self.COVERAGE_AREA,
+                self.tr('Coverage Area (Required for Mobile Energy Storage Only)'),
+                [QgsProcessing.TypeVectorPolygon],
+                optional=True  # Optional because it's only needed for mobile model
+            )
+        )
+
+        # Distance Method - only applicable for Static Energy Storage (section 3.2.2.1)
         self.addParameter(
             QgsProcessingParameterEnum(
                 self.DISTANCE_METHOD,
                 self.tr('Select distance calculation method '
-                        '(Only for static case, for mobile the only option is time travel through the road network'),
-                options=['Road distance', 'Haversine distance (straight-line)', ],
+                        '(Only for static model, for mobile model the only option is time travel through the road network)'),
+                options=['Road distance', 'Haversine distance (straight-line)'],
                 defaultValue=0  # Default to Road distance
             )
         )
 
+        # Candidates Layer - required for both models
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.CANDIDATES_LAYER,
@@ -105,16 +137,18 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        # Buffer Distance - only used for Static Energy Storage (section 3.2.2.2)
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.BUFFER_DISTANCE,
-                self.tr('Buffer distance (in kilometers)'),
+                self.tr('Buffer distance in kilometers (Required For Static Energy Storage Only)'),
                 QgsProcessingParameterNumber.Double,
                 defaultValue=1.0,
                 minValue=0.0
             )
         )
 
+        # Critical Infrastructure Layers - required for both models
         self.addParameter(
             QgsProcessingParameterMultipleLayers(
                 self.CRITICAL_INFRASTRUCTURES,
@@ -123,7 +157,7 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # Add the parameter for critical infrastructure weights with the correct name
+        # Infrastructure Weights - required for both models
         self.addParameter(
             QgsProcessingParameterString(
                 self.INFRASTRUCTURE_WEIGHTS,
@@ -133,22 +167,25 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        # Census Data Layer - required for both models
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.CENSUS_DATA_LAYER,
-                self.tr('Input here you Census Data Layer'),
+                self.tr('Census Data Layer'),
                 [QgsProcessing.TypeVectorPolygon]  # Accept only polygon layers
             )
         )
 
+        # Census Data Weights - required for both models
         self.addParameter(
             QgsProcessingParameterString(
                 self.CENSUS_DATA_WEIGHTS,
                 self.tr('Enter weights for the census data variables (comma-separated)'),
-                defaultValue='0.25,0.25,0.25,0.25'  # Example default value for 4 layers
+                defaultValue='0.25,0.25,0.25,0.25'  # Example default value for 4 variables
             )
         )
 
+        # Critical Zones Layers - required for both models
         self.addParameter(
             QgsProcessingParameterMultipleLayers(
                 self.CRITICAL_ZONES,
@@ -157,6 +194,7 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        # Critical Zone Scores - required for both models
         self.addParameter(
             QgsProcessingParameterString(
                 self.CRITICAL_ZONE_SCORES,
@@ -166,26 +204,45 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        # Output Layer - required for both models
         self.addParameter(
             QgsProcessingParameterFeatureSink(
-                self.OUTPUT,  # This is the key line to define the OUTPUT parameter
-                self.tr('Output layer')
+                self.OUTPUT,
+                self.tr('Output layer'),
+                QgsProcessing.TypeVectorAnyGeometry  # Allow both points and polygons
             )
         )
 
     def safe_field_name(self, layer_name):
+        """
+        Convert a layer name to a safe field name.
+        
+        Args:
+            layer_name (str): Original layer name
+            
+        Returns:
+            str: Safe field name with spaces replaced and special characters removed
+        """
         # Replace spaces with underscores and remove special characters
         return ''.join([c if c.isalnum() or c == '_' else '' for c in layer_name.replace(' ', '_')])
 
     def _initialize_output_fields(self):
-        """Initialize the output layer fields structure."""
-        buffer_fields = QgsFields()
-        buffer_fields.append(QgsField('id', QVariant.Int))
-        buffer_fields.append(QgsField('name', QVariant.String))
-        return buffer_fields
+        """
+        Initialize the base output layer fields structure.
+        
+        Returns:
+            QgsFields: Base fields for the output layer
+        """
+        output_fields = QgsFields()
+        output_fields.append(QgsField('id', QVariant.Int))
+        output_fields.append(QgsField('name', QVariant.String))
+        return output_fields
 
     def _validate_weights(self, weights_str, expected_count, weight_type):
-        """Validate and normalize weights.
+        """
+        Validate and normalize weights.
+        
+        As described in sections 3.2.4.4 and 3.3.4.4, weights must sum to 1.0.
         
         Args:
             weights_str (str): Comma-separated weights
@@ -194,6 +251,9 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
             
         Returns:
             list: Normalized weights
+            
+        Raises:
+            QgsProcessingException: If weights are invalid
         """
         try:
             weights = [float(w) for w in weights_str.split(',')]
@@ -216,425 +276,506 @@ class EnergyStorageLocationEvaluatorAlgorithm(QgsProcessingAlgorithm):
             
         return weights
 
-    def _add_infrastructure_fields(self, buffer_fields, infra_layers):
-        """Add infrastructure-related fields to the output structure."""
+    def _add_infrastructure_fields(self, output_fields, infra_layers, evaluation_type):
+        """
+        Add infrastructure-related fields to the output structure.
+        
+        The fields differ between static and mobile models:
+        - For Static Model (evaluation_type = 0): Includes outage costs (section 3.2.4.3)
+        - For Mobile Model (evaluation_type = 1): Focuses on travel times (section 3.3.4.2.1)
+        
+        Args:
+            output_fields (QgsFields): Fields to add to
+            infra_layers (list): List of infrastructure layers
+            evaluation_type (int): 0 for static, 1 for mobile
+            
+        Returns:
+            QgsFields: Updated fields
+        """
         for layer in infra_layers:
             infra_name = self.safe_field_name(layer.name())
-            buffer_fields.append(QgsField(f'{infra_name}_Count', QVariant.Int))
-            buffer_fields.append(QgsField(f'{infra_name}_Raw_Score', QVariant.Double))
-            buffer_fields.append(QgsField(f'{infra_name}_Normalized_Score', QVariant.Double))
-            # Add field for outage costs per infrastructure type
-            buffer_fields.append(QgsField(f'{infra_name}_Outage_Cost_Savings', QVariant.Double))
-        buffer_fields.append(QgsField('Total_Infrastructure_Score', QVariant.Double))
-        # Add field for total outage cost savings
-        buffer_fields.append(QgsField('Total_Outage_Cost_Savings', QVariant.Double))
-        return buffer_fields
+            # Truncate to 10 chars for shapefile compatibility but store full name
+            short_name = infra_name[:10]
+            
+            # Basic score fields needed for both models
+            count_field = QgsField(f'{short_name}_Cnt', QVariant.Int)
+            count_field.setAlias(f'{layer.name()} Count')
+            output_fields.append(count_field)
+            
+            raw_field = QgsField(f'{short_name}_Raw', QVariant.Double)
+            raw_field.setAlias(f'{layer.name()} Raw Score')
+            output_fields.append(raw_field)
+            
+            final_field = QgsField(f'{short_name}_Fnl', QVariant.Double)
+            final_field.setAlias(f'{layer.name()} Final Score')
+            output_fields.append(final_field)
+            
+            if evaluation_type == 0:  # Static Energy Storage
+                # Only static model tracks outage costs (section 3.2.4.3)
+                cost_field = QgsField(f'{short_name}_Cost', QVariant.Double)
+                cost_field.setAlias(f'{layer.name()} Outage Cost')
+                output_fields.append(cost_field)
+        
+        total_infra_field = QgsField('TotalInfra', QVariant.Double)
+        total_infra_field.setAlias('Total Infrastructure Score')
+        output_fields.append(total_infra_field)
+        
+        # Add total outage cost field only for static model (section 3.2.4.3)
+        if evaluation_type == 0:  # Static Energy Storage
+            total_cost_field = QgsField('TotalCost', QVariant.Double)
+            total_cost_field.setAlias('Total Outage Cost Savings')
+            output_fields.append(total_cost_field)
+            
+        return output_fields
 
-    def _add_census_fields(self, buffer_fields, census_layer):
-        """Add census-related fields and extract census variables."""
+    def _add_census_fields(self, output_fields, census_layer):
+        """
+        Add census-related fields and extract census variables.
+        
+        Both models use the same approach for census data, as specified in 
+        sections 3.2.4.2.2 and 3.3.4.2.2.
+        
+        Args:
+            output_fields (QgsFields): Fields to add to
+            census_layer: Census data layer
+            
+        Returns:
+            tuple: (updated fields, list of census variables)
+        """
         census_fields = census_layer.fields()
         census_variables = []
         
         for i in range(6, len(census_fields)):
             field_name = census_fields.at(i).name()
             census_variables.append(field_name)
-            buffer_fields.append(QgsField(f'{field_name}_Value', QVariant.Double))
-            buffer_fields.append(QgsField(f'{field_name}_Score', QVariant.Double))
             
-        return buffer_fields, census_variables
+            # Create short field names with full aliases
+            short_name = field_name[:8]
+            
+            val_field = QgsField(f'{short_name}_Val', QVariant.Double)
+            val_field.setAlias(f'{field_name} Value')
+            output_fields.append(val_field)
+            
+            score_field = QgsField(f'{short_name}_Scr', QVariant.Double)
+            score_field.setAlias(f'{field_name} Score')
+            output_fields.append(score_field)
+            
+        return output_fields, census_variables
 
-    def _add_zone_fields(self, buffer_fields, zone_layers):
-        """Add zone-related fields to the output structure."""
+    def _add_zone_fields(self, output_fields, zone_layers):
+        """
+        Add zone-related fields to the output structure.
+        
+        Both models use the same approach for critical zones, as specified in
+        sections 3.2.4.2.3 and 3.3.4.2.2.
+        
+        Args:
+            output_fields (QgsFields): Fields to add to
+            zone_layers: List of zone layers
+            
+        Returns:
+            QgsFields: Updated fields
+        """
         for layer in zone_layers:
             zone_name = self.safe_field_name(layer.name())
-            buffer_fields.append(QgsField(f'{zone_name}_Score', QVariant.Double))
+            # Create shorter field name with full alias
+            short_name = zone_name[:8]
+            
+            zone_field = QgsField(f'{short_name}_Scr', QVariant.Double)
+            zone_field.setAlias(f'{layer.name()} Score')
+            output_fields.append(zone_field)
         
-        buffer_fields.append(QgsField('Total_Zones_Score', QVariant.Double))
-        buffer_fields.append(QgsField('Final_Score', QVariant.Double))
-        return buffer_fields
+        total_zone_field = QgsField('TotalZones', QVariant.Double)
+        total_zone_field.setAlias('Total Zones Score')
+        output_fields.append(total_zone_field)
+        
+        # Add total demographic/census score field
+        total_demo_field = QgsField('TotalDemo', QVariant.Double)
+        total_demo_field.setAlias('Total Demographic Score')
+        output_fields.append(total_demo_field)
+        
+        final_field = QgsField('FinalScore', QVariant.Double)
+        final_field.setAlias('Final Score')
+        output_fields.append(final_field)
+        
+        return output_fields
 
     def _log_crs_info(self, candidate_layer, infra_layers, feedback):
-        """Log CRS information for debugging."""
+        """
+        Log CRS information for debugging.
+        
+        Args:
+            candidate_layer: Candidate layer
+            infra_layers: List of infrastructure layers
+            feedback: Feedback object for logging
+        """
         feedback.pushInfo(f"Candidate layer CRS: {candidate_layer.sourceCrs().authid()}")
         for i, layer in enumerate(infra_layers):
             feedback.pushInfo(f"Infrastructure layer {i+1} ({layer.name()}) CRS: {layer.crs().authid()}")
 
-    def processAlgorithm(self, parameters, context, feedback):
-        """Process the algorithm."""
-        feedback.pushInfo("Starting processAlgorithm")
-
-        # Initialize the static evaluator
-        evaluator = StaticEnergyStorageEvaluator(feedback)
-
-        # Part 1: Get input parameters
-        candidate_layer = self.parameterAsSource(parameters, self.CANDIDATES_LAYER, context)
-        buffer_distance_km = self.parameterAsDouble(parameters, self.BUFFER_DISTANCE, context)
-        energy_storage_type = self.parameterAsEnum(parameters, self.EVALUATION_TYPE, context)
-        distance_method = self.parameterAsEnum(parameters, self.DISTANCE_METHOD, context)
-        
-        # Get layers and their corresponding weights/scores
-        infra_layers = self.parameterAsLayerList(parameters, self.CRITICAL_INFRASTRUCTURES, context)
-        infra_weights_str = self.parameterAsString(parameters, self.INFRASTRUCTURE_WEIGHTS, context)
-        
-        census_layer = self.parameterAsSource(parameters, self.CENSUS_DATA_LAYER, context)
-        census_weights_str = self.parameterAsString(parameters, self.CENSUS_DATA_WEIGHTS, context)
-        
-        zone_layers = self.parameterAsLayerList(parameters, self.CRITICAL_ZONES, context)
-        zone_scores_str = self.parameterAsString(parameters, self.CRITICAL_ZONE_SCORES, context)
-
-        # Part 2: Initialize output structure
-        buffer_fields = self._initialize_output_fields()
-        buffer_fields = self._add_infrastructure_fields(buffer_fields, infra_layers)
-        buffer_fields, census_variables = self._add_census_fields(buffer_fields, census_layer)
-        buffer_fields = self._add_zone_fields(buffer_fields, zone_layers)
-
-        # Part 3: Validate weights using the evaluator
-        infra_weights, census_weights = evaluator.validate_weights(
-            infra_weights_str, census_weights_str,
-            len(infra_layers), len(census_variables)
-        )
-
-        # Parse zone scores
-        try:
-            zone_scores = [float(s) for s in zone_scores_str.split(',')]
-            if len(zone_scores) != len(zone_layers):
-                raise QgsProcessingException(
-                    f"Number of zone scores ({len(zone_scores)}) does not match "
-                    f"number of zone layers ({len(zone_layers)})"
-                )
-        except ValueError:
-            raise QgsProcessingException("Zone scores must be numeric values")
-
-        # Convert buffer distance to meters
-        buffer_distance = buffer_distance_km * 1000
-
-        # Create candidates
-        candidates = []
-        total = candidate_layer.featureCount()
-        for current, feature in enumerate(candidate_layer.getFeatures()):
-            if feedback.isCanceled():
-                break
-            candidate = Candidate(feature, buffer_distance, feedback)
-            candidates.append(candidate)
-            feedback.setProgress(int(current * 100 / total))
-
-        # Process critical zones
-        evaluator.evaluate_critical_zones(candidates, zone_layers, zone_scores)
-
-        # Process infrastructure
-        for candidate in candidates:
-            if feedback.isCanceled():
-                break
-            evaluator.evaluate_infrastructure(
-                candidate, infra_layers, infra_weights,
-                buffer_distance, distance_method
-            )
-
-        # Process census data
-        for candidate in candidates:
-            if feedback.isCanceled():
-                break
-            for census_feature in census_layer.getFeatures():
-                if census_feature.geometry().contains(candidate.feature.geometry()):
-                    for var in census_variables:
-                        value = census_feature[var]
-                        candidate.set_census_data(var, value)
-                    break
-
-        # Normalize and weight scores
-        evaluator.normalize_and_weight_scores(
-            candidates, infra_layers, census_variables,
-            infra_weights, census_weights
-        )
-
-        # Calculate final scores
-        evaluator.calculate_final_scores(candidates)
-
-        # Create output layer
-        (sink, dest_id) = self.parameterAsSink(
-            parameters, self.OUTPUT, context,
-            buffer_fields, QgsWkbTypes.Polygon, candidate_layer.sourceCrs()
-        )
-
-        feedback.pushInfo(f"Created output sink with {len(buffer_fields)} fields")
-        
-        # Write results to output layer
-        for candidate in candidates:
-            if feedback.isCanceled():
-                break
-
-            # Debug buffer geometry
-            if not candidate.buffer.isGeosValid():
-                feedback.pushWarning(f"Invalid buffer geometry for candidate {candidate.id}")
-                continue
-                
-            feedback.pushInfo(f"Processing candidate {candidate.id} with buffer area: {candidate.buffer.area()}")
-
-            feature = QgsFeature(buffer_fields)
-            feature.setGeometry(candidate.buffer)
-
-            # Get proper ID for the feature, first try to use the Id field if present
-            # Otherwise fall back to the feature's internal ID
-            feature_id = candidate.id  # Default to candidate's internal ID
-            
-            try:
-                # Check for 'Id' field first (capital I, lowercase d)
-                if 'Id' in candidate.feature.fields().names():
-                    feature_id = candidate.feature['Id']
-                    feedback.pushInfo(f"Using 'Id' field value: {feature_id}")
-                # Only fall back to these if 'Id' is not found
-                elif 'ID' in candidate.feature.fields().names():
-                    feature_id = candidate.feature['ID']
-                    feedback.pushInfo(f"Using 'ID' field value: {feature_id}")
-                elif 'id' in candidate.feature.fields().names():
-                    feature_id = candidate.feature['id']
-                    feedback.pushInfo(f"Using 'id' field value: {feature_id}")
-            except KeyError:
-                feedback.pushInfo(f"No Id field found, using internal ID: {feature_id}")
-            
-            # Get proper Name for the feature
-            feature_name = None
-            try:
-                # First check for 'Name' with capital N
-                if 'Name' in candidate.feature.fields().names():
-                    feature_name = str(candidate.feature['Name'])
-                    feedback.pushInfo(f"Using 'Name' field value: {feature_name}")
-                # Then check for lowercase 'name'
-                elif 'name' in candidate.feature.fields().names():
-                    feature_name = str(candidate.feature['name'])
-                    feedback.pushInfo(f"Using 'name' field value: {feature_name}")
-            except KeyError:
-                pass
-                
-            # If no name was found, use Id as the name
-            if not feature_name:
-                feature_name = f'Candidate {feature_id}'
-                feedback.pushInfo(f"No Name field found, using ID as name: {feature_name}")
-            
-            attrs = [feature_id, feature_name]
-
-            # Add infrastructure attributes
-            for layer in infra_layers:
-                name = layer.name()
-                info = candidate.infrastructures.get(name, {})
-                
-                # Get outage cost total for this infrastructure type
-                outage_costs = candidate.outage_costs.get(name, [])
-                outage_cost_total = sum(outage_costs)
-                
-                attrs.extend([
-                    info.get('count', 0),
-                    info.get('raw_score', 0),
-                    info.get('normalized_score', 0),  # Changed from 'weighted_score' to match field name
-                    outage_cost_total  
-                ])
-            
-            # Add total scores
-            attrs.append(candidate.total_infra_score)
-            attrs.append(candidate.total_outage_cost_savings)
-            
-            # Add census attributes
-            for var in census_variables:
-                attrs.extend([
-                    candidate.census_data.get(var, 0),
-                    candidate.census_scores.get(var, 0)
-                ])
-
-            # Add zone scores
-            for layer in zone_layers:
-                name = layer.name()
-                attrs.append(candidate.critical_zones.get(name, 0))
-
-            # Add final scores
-            attrs.extend([
-                candidate.total_zone_score,
-                candidate.final_score
-            ])
-
-            # Debug attribute count vs field count
-            if len(attrs) != len(buffer_fields):
-                feedback.pushWarning(f"Attribute count ({len(attrs)}) doesn't match field count ({len(buffer_fields)})")
-                feedback.pushInfo(f"Fields: {[field.name() for field in buffer_fields]}")
-                feedback.pushInfo(f"First 10 attributes: {attrs[:10]}")
-                continue
-                
-            feature.setAttributes(attrs)
-            
-            # Check if feature is valid before adding
-            if not feature.isValid():
-                feedback.pushWarning(f"Invalid feature created for candidate {candidate.id}")
-                continue
-                
-            result = sink.addFeature(feature, QgsFeatureSink.FastInsert)
-            feedback.pushInfo(f"Added feature for candidate {candidate.id}: {'Success' if result else 'Failed'}")
-
-            feedback.setProgress(80 + int((candidates.index(candidate) / len(candidates)) * 20))
-
-        return {self.OUTPUT: dest_id}
-
-    def get_intersecting_features(self, buffer, layer):
+    def _prepare_output_fields(self, candidates_layer, infra_layers, evaluation_type, census_layer):
         """
-        Get features from layer that intersect with buffer geometry.
+        Prepare the complete set of output fields for the result layer.
+        
+        This combines fields from infrastructure, census data, and critical zones
+        based on the evaluation type (static or mobile).
         
         Args:
-            buffer: Buffer geometry in the candidate's CRS
-            layer: Layer to get features from, potentially in a different CRS
+            candidates_layer: Candidate layer
+            infra_layers: List of infrastructure layers
+            evaluation_type (int): 0 for static, 1 for mobile
+            census_layer: Census data layer
             
         Returns:
-            List of features that intersect with buffer
+            QgsFields: Complete set of output fields
         """
-        intersecting_features = []
+        # Start with base fields
+        output_fields = self._initialize_output_fields()
         
-        # Check if the buffer geometry is valid
-        if not buffer.isGeosValid():
-            self.feedback.reportError(f"Buffer geometry is not valid for layer: {layer.name()}")
-            return intersecting_features
+        # Add infrastructure fields - different between static and mobile
+        output_fields = self._add_infrastructure_fields(output_fields, infra_layers, evaluation_type)
         
-        # Debug buffer information
-        self.feedback.pushInfo(f"Buffer type: {buffer.wkbType()}, area: {buffer.area():.2f} sq meters")
+        # Add census fields if census layer is provided - same for both models
+        if census_layer:
+            output_fields, census_variables = self._add_census_fields(output_fields, census_layer)
         
-        # Get buffer CRS information
-        buffer_crs = QgsProject.instance().crs()
-        layer_crs = layer.crs()
-        
-        self.feedback.pushInfo(f"Buffer CRS: {buffer_crs.authid()}, Layer CRS: {layer_crs.authid()}")
-        
-        # Get the buffer centroid for debugging
-        centroid = buffer.centroid().asPoint()
-        self.feedback.pushInfo(f"Buffer centroid: ({centroid.x():.6f}, {centroid.y():.6f})")
-        
-        # Calculate approximate buffer radius from area (for debugging)
-        buffer_radius = (buffer.area() / 3.14159) ** 0.5
-        self.feedback.pushInfo(f"Calculated buffer radius: {buffer_radius:.2f} meters")
-        
-        # Create a copy of the buffer geometry for transformation
-        buffer_geom = QgsGeometry(buffer)
-        
-        # Transform buffer to layer CRS if needed
-        if buffer_crs.authid() != layer_crs.authid():
-            self.feedback.pushInfo(f"Transforming buffer from {buffer_crs.authid()} to {layer_crs.authid()}")
-            try:
-                transform = QgsCoordinateTransform(buffer_crs, layer_crs, QgsProject.instance())
-                buffer_geom.transform(transform)
-                
-                # Debug the transformed buffer
-                transformed_centroid = buffer_geom.centroid().asPoint()
-                self.feedback.pushInfo(f"Transformed buffer centroid: ({transformed_centroid.x():.6f}, {transformed_centroid.y():.6f})")
-                self.feedback.pushInfo(f"Transformed buffer area: {buffer_geom.area():.2f} sq meters")
-            except Exception as e:
-                self.feedback.reportError(f"Error transforming buffer: {str(e)}")
-                # In case of transformation error, return empty result
-                return intersecting_features
-        
-        # Get the correct bounding box from the buffer geometry
-        bbox = buffer_geom.boundingBox()
-        
-        # Debug the bounding box (should be in the layer's CRS)
-        self.feedback.pushInfo(f"Bounding box min: ({bbox.xMinimum():.6f}, {bbox.yMinimum():.6f})")
-        self.feedback.pushInfo(f"Bounding box max: ({bbox.xMaximum():.6f}, {bbox.yMaximum():.6f})")
-        self.feedback.pushInfo(f"Bounding box width: {bbox.width():.6f}, height: {bbox.height():.6f}")
-        
-        # ALWAYS create a manual bounding box for more reliable results
-        # This fixes the issue with invalid bounding boxes
-        center = buffer_geom.centroid().asPoint()
-        
-        # Set appropriate delta based on the CRS
-        if layer_crs.authid().startswith("EPSG:4326"):
-            # For EPSG:4326 (WGS 84), use degrees (about 2km at equator)
-            delta = 0.02
-        else:
-            # For projected CRSs, use meters/feet based on buffer radius
-            delta = buffer_radius * 1.1  # 10% larger than buffer radius
-        
-        # Create a manual bounding box
-        manual_bbox = QgsRectangle(
-            center.x() - delta,
-            center.y() - delta,
-            center.x() + delta,
-            center.y() + delta
+        # Add zone fields - same for both models
+        zone_layers = self.parameterAsLayerList(
+            self.parameters, self.CRITICAL_ZONES, self.context
         )
+        output_fields = self._add_zone_fields(output_fields, zone_layers)
         
-        self.feedback.pushInfo(f"Created manual bbox: ({manual_bbox.xMinimum():.6f}, {manual_bbox.yMinimum():.6f}) - ({manual_bbox.xMaximum():.6f}, {manual_bbox.yMaximum():.6f})")
-        bbox = manual_bbox
+        return output_fields
+
+    def processAlgorithm(self, parameters, context, feedback):
+        """
+        Execute the algorithm to evaluate energy storage locations.
         
-        # Use the corrected bounding box for spatial filtering
-        request = QgsFeatureRequest().setFilterRect(bbox)
+        This method handles both static and mobile energy storage models, selecting
+        the appropriate model based on the evaluation_type parameter. It manages
+        parameter validation, data processing, and result generation for both models.
         
-        # Count features in layer and in bounding box
-        total_features = layer.featureCount()
-        feature_count_in_bbox = 0
-        contained_features = 0
-        
-        # Process features within the bounding box and check actual containment
-        for feature in layer.getFeatures(request):
-            feature_count_in_bbox += 1
-            geom = feature.geometry()
+        Args:
+            parameters: Algorithm parameters
+            context: Processing context
+            feedback: Feedback object for logging
             
-            if not geom or not geom.isGeosValid():
-                self.feedback.pushInfo(f"Skipping invalid geometry in layer {layer.name()}")
-                continue
-                
-            # Check if the feature is truly inside or intersects the buffer
-            # For point features, check containment
-            if buffer_geom.contains(geom):
-                contained_features += 1
-                intersecting_features.append(feature)
-                
-                # Log only a limited number of points to avoid overwhelming logs
-                if contained_features <= 5:
-                    if geom.type() == QgsWkbTypes.PointGeometry:
-                        point = geom.asPoint()
-                        self.feedback.pushInfo(f"Found point inside buffer at {point.x():.6f}, {point.y():.6f}")
-            elif buffer_geom.intersects(geom):
-                # For non-point features that intersect but aren't contained
-                intersecting_features.append(feature)
-                contained_features += 1
-                if contained_features <= 5:
-                    self.feedback.pushInfo("Found intersecting feature (not contained)")
-        
-        # Report statistics
-        self.feedback.pushInfo(f"Layer {layer.name()} has {total_features} total features")
-        self.feedback.pushInfo(f"Features in bounding box: {feature_count_in_bbox}")
-        self.feedback.pushInfo(f"Features actually contained or intersecting buffer: {contained_features}")
-        
-        # Add containment ratio statistics if applicable
-        if feature_count_in_bbox > 0:
-            containment_ratio = contained_features / feature_count_in_bbox
-            self.feedback.pushInfo(f"Containment ratio: {containment_ratio:.2%}")
+        Returns:
+            dict: Output layer ID
+        """
+        self.feedback = feedback
+        self.parameters = parameters
+        self.context = context
+        feedback.pushInfo('Starting Energy Storage Location Evaluator')
+        try:
+            # Extract common parameters for both models
+            candidates_layer = self.parameterAsSource(parameters, self.CANDIDATES_LAYER, context)
+            evaluation_type = self.parameterAsInt(parameters, self.EVALUATION_TYPE, context)
             
-        return intersecting_features
+            infra_layers = self.parameterAsLayerList(parameters, self.CRITICAL_INFRASTRUCTURES, context)
+            census_layer = self.parameterAsSource(parameters, self.CENSUS_DATA_LAYER, context)
+            zone_layers = self.parameterAsLayerList(parameters, self.CRITICAL_ZONES, context)
+            
+            infra_weights = parameters[self.INFRASTRUCTURE_WEIGHTS]
+            census_weights = parameters[self.CENSUS_DATA_WEIGHTS]
+            
+            try:
+                zone_scores = [float(x) for x in parameters[self.CRITICAL_ZONE_SCORES].split(',')]
+            except ValueError:
+                raise QgsProcessingException("Critical zone scores must be numeric values separated by commas.")
+            
+            # Validate common parameters
+            if not candidates_layer:
+                raise QgsProcessingException("No candidates layer provided")
+            if not infra_layers:
+                raise QgsProcessingException("No infrastructure layers provided")
+            if len(zone_layers) != len(zone_scores):
+                raise QgsProcessingException(
+                    f"Number of zone scores ({len(zone_scores)}) does not match "
+                    f"number of critical zone layers ({len(zone_layers)})"
+                )
+            
+            # Extract and validate model-specific parameters
+            if evaluation_type == 0:  # Static Energy Storage Model
+                # For static model, buffer distance and distance method are required
+                buffer_distance = self.parameterAsDouble(parameters, self.BUFFER_DISTANCE, context)
+                distance_method = self.parameterAsInt(parameters, self.DISTANCE_METHOD, context)
+                
+                if buffer_distance <= 0:
+                    raise QgsProcessingException("Buffer distance must be greater than 0 for static model")
+                
+                # Convert buffer distance to meters (static model uses meters)
+                buffer_distance_meters = buffer_distance * 1000
+                
+                feedback.pushInfo(f"Using Static Energy Storage Model with buffer distance: {buffer_distance}km ({buffer_distance_meters}m)")
+                feedback.pushInfo(f"Distance method: {['Road', 'Haversine'][distance_method]}")
+                
+            else:  # Mobile Energy Storage Model
+                # For mobile model, coverage area is required
+                coverage_area = self.parameterAsSource(parameters, self.COVERAGE_AREA, context)
+                
+                if not coverage_area:
+                    raise QgsProcessingException("Coverage area is required for mobile energy storage evaluation")
+                
+                # Extract coverage geometry
+                coverage_geom = None
+                for feature in coverage_area.getFeatures():
+                    coverage_geom = feature.geometry()
+                    break
+                
+                if not coverage_geom:
+                    raise QgsProcessingException("Empty coverage area geometry")
+                
+                feedback.pushInfo("Using Mobile Energy Storage Model with user-defined coverage area")
+            
+            # Create output fields structure based on evaluation type
+            fields = self._prepare_output_fields(candidates_layer, infra_layers, 
+                                              evaluation_type, census_layer)
+            
+            # Create the sink (output layer) with appropriate geometry type
+            if evaluation_type == 0:  # Static Energy Storage - uses polygon (buffer) outputs
+                sink, dest_id = self.parameterAsSink(
+                    parameters, self.OUTPUT, context, fields, 
+                    QgsWkbTypes.Polygon, candidates_layer.sourceCrs()
+                )
+            else:  # Mobile Energy Storage - uses point outputs
+                sink, dest_id = self.parameterAsSink(
+                    parameters, self.OUTPUT, context, fields, 
+                    QgsWkbTypes.Point, candidates_layer.sourceCrs()
+                )
+            
+            if sink is None:
+                raise QgsProcessingException("Failed to create output layer")
+            
+            feedback.pushInfo(f"Created output sink with {len(fields)} fields")
+            
+            # Initialize the appropriate model based on evaluation type
+            if evaluation_type == 0:  # Static Energy Storage
+                model = StaticEnergyStorageEvaluator(feedback)
+            else:  # Mobile Energy Storage
+                model = MobileEnergyStorageEvaluator(feedback)
+            
+            # Initialize candidates based on model type
+            candidates = []
+            total_features = candidates_layer.featureCount()
+            feedback.pushInfo(f"Processing {total_features} candidate locations")
+            
+            for current, feature in enumerate(candidates_layer.getFeatures()):
+                if feedback.isCanceled():
+                    break
+                    
+                try:
+                    if evaluation_type == 0:  # Static Energy Storage
+                        # For static model, buffer_distance is required (section 3.2.2.2)
+                        candidate = StaticCandidate(feature, buffer_distance_meters, feedback)
+                    else:  # Mobile Energy Storage
+                        # For mobile model, buffer parameter is not used (section 3.3.2.2)
+                        # but we still pass the parameter for API compatibility
+                        candidate = MobileCandidate(feature, None, feedback)
+                        
+                    candidates.append(candidate)
+                    feedback.setProgress(int(current * 20 / total_features))  # 0-20% progress
+                    
+                except Exception as e:
+                    feedback.reportError(f"Error initializing candidate {current}: {str(e)}")
+                    continue
+            
+            # Process census data and extract variables
+            try:
+                census_vars = []
+                if census_layer:
+                    census_fields = census_layer.fields()
+                    census_vars = [field.name() for field in census_fields 
+                                 if field.isNumeric() and not field.name().lower() in ('id', 'fid')]
+                    
+                    if not census_vars:
+                        feedback.pushWarning("No numeric census variables found in census layer")
+                
+                # Validate weights through the model
+                infra_weights_list, census_weights_list = model.validate_weights(
+                    infra_weights, census_weights,
+                    len(infra_layers), len(census_vars)
+                )
+            except Exception as e:
+                raise QgsProcessingException(f"Weight validation failed: {str(e)}")
+            
+            # Process census data if available
+            if census_layer and census_vars:
+                feedback.pushInfo(f"Processing census data with {len(census_vars)} variables")
+                for i, candidate in enumerate(candidates):
+                    if feedback.isCanceled():
+                        break
+                    try:
+                        self._process_census_data(candidate, census_layer, census_vars)
+                    except Exception as e:
+                        feedback.reportError(f"Error processing census data for candidate {candidate.id}: {str(e)}")
+                    
+                    if i % 10 == 0:  # Update progress every 10 candidates
+                        feedback.setProgress(20 + int(i * 10 / len(candidates)))  # 20-30% progress
+            
+            # Evaluate critical zones
+            try:
+                feedback.pushInfo(f"Evaluating {len(zone_layers)} critical zones")
+                model.evaluate_critical_zones(candidates, zone_layers, zone_scores)
+            except Exception as e:
+                feedback.reportError(f"Error evaluating critical zones: {str(e)}")
+                # Continue despite errors
+            
+            # Evaluate infrastructures based on model type
+            feedback.pushInfo(f"Evaluating {len(infra_layers)} infrastructure layers")
+            for i, candidate in enumerate(candidates):
+                if feedback.isCanceled():
+                    break
+                try:
+                    if evaluation_type == 0:  # Static model
+                        # Static model needs buffer_distance and distance_method
+                        model.evaluate_infrastructure(
+                            candidate, infra_layers, infra_weights_list, 
+                            buffer_distance_meters, distance_method
+                        )
+                    else:  # Mobile model
+                        # Mobile model needs coverage_geom
+                        model.evaluate_infrastructure(
+                            candidate, infra_layers, infra_weights_list, coverage_geom
+                        )
+                except Exception as e:
+                    feedback.reportError(f"Error evaluating infrastructure for candidate {candidate.id}: {str(e)}")
+                
+                if i % 10 == 0:  # Update progress every 10 candidates
+                    feedback.setProgress(30 + int(i * 40 / len(candidates)))  # 30-70% progress
+            
+            # Normalize and calculate final scores
+            try:
+                feedback.pushInfo("Normalizing and calculating final scores")
+                model.normalize_and_weight_scores(
+                    candidates, infra_layers, census_vars, 
+                    infra_weights_list, census_weights_list
+                )
+                model.calculate_final_scores(candidates)
+            except Exception as e:
+                feedback.reportError(f"Error calculating final scores: {str(e)}")
+                raise
+            
+            # Write results to output layer
+            feedback.pushInfo("Writing results to output layer")
+            for i, candidate in enumerate(candidates):
+                if feedback.isCanceled():
+                    break
+                try:
+                    feat = QgsFeature(fields)
+                    
+                    # Use the appropriate geometry based on the model type
+                    if evaluation_type == 0:  # Static Energy Storage - use buffer polygon
+                        if not candidate.buffer:
+                            feedback.reportError(f"Missing buffer geometry for candidate {candidate.id}")
+                            continue
+                            
+                        if not candidate.buffer.isGeosValid():
+                            feedback.reportError(f"Invalid buffer geometry for candidate {candidate.id}")
+                            continue
+                            
+                        feat.setGeometry(candidate.buffer)
+                        feedback.pushInfo(f"Adding buffer polygon for candidate {candidate.id}, area: {candidate.buffer.area():.2f}m²")
+                    else:  # Mobile Energy Storage - use point geometry
+                        feat.setGeometry(candidate.feature.geometry())
+                    
+                    # Generate output attributes from candidate
+                    attrs = candidate.generate_output_attributes()
+                    feat.setAttributes(attrs)
+                    
+                    if not sink.addFeature(feat, QgsFeatureSink.FastInsert):
+                        feedback.reportError(f"Failed to add feature for candidate {candidate.id}")
+                except Exception as e:
+                    feedback.reportError(f"Error writing output for candidate {candidate.id}: {str(e)}")
+                
+                if i % 10 == 0:  # Update progress every 10 candidates
+                    feedback.setProgress(70 + int(i * 30 / len(candidates)))  # 70-100% progress
+            
+            feedback.pushInfo("Energy Storage Location Evaluation completed successfully")
+            return {'OUTPUT': dest_id}
+            
+        except QgsProcessingException as e:
+            feedback.reportError(f"Error: {str(e)}")
+            raise
+        except Exception as e:
+            feedback.reportError(f"Critical error in processAlgorithm: {str(e)}")
+            raise
+
+    def _process_census_data(self, candidate, census_layer, census_vars):
+        """
+        Process census data for a candidate location.
+        
+        For both models, this identifies the census area that intersects with
+        the candidate and extracts the relevant census variables.
+        
+        Args:
+            candidate: Candidate object (static or mobile)
+            census_layer: Census data layer
+            census_vars: List of census variable names to extract
+            
+        Raises:
+            Exception: If there's an error processing the census data
+        """
+        try:
+            # Get candidate geometry
+            candidate_geom = candidate.feature.geometry()
+            
+            if not candidate_geom.isGeosValid():
+                candidate_geom = candidate_geom.makeValid()
+            
+            found_intersection = False
+            
+            # For each census feature, check if it intersects with the candidate
+            for census_feature in census_layer.getFeatures():
+                census_geom = census_feature.geometry()
+                
+                if not census_geom.isGeosValid():
+                    census_geom = census_geom.makeValid()
+                
+                if census_geom.intersects(candidate_geom):
+                    # Found intersecting census area, extract the values
+                    for var_name in census_vars:
+                        if var_name in census_feature.fields().names():
+                            value = census_feature[var_name]
+                            if value is not None and value != "NULL":
+                                try:
+                                    value_float = float(value)
+                                    # Store the raw census data value
+                                    candidate.set_census_data(var_name, value_float)
+                                except (ValueError, TypeError):
+                                    self.feedback.pushInfo(f"Could not convert census value '{value}' to number")
+                    
+                    found_intersection = True
+                    break  # Assuming each candidate is in only one census area
+            
+            if not found_intersection:
+                self.feedback.pushWarning(f"No intersecting census area found for candidate {candidate.id}")
+                
+        except Exception as e:
+            self.feedback.reportError(f"Error in _process_census_data: {str(e)}")
+            raise
 
     def name(self):
         """
-        Returns the algorithm name, used for identifying the algorithm. This
-        string should be fixed for the algorithm, and must not be localised.
-        The name should be unique within each provider. Names should contain
-        lowercase alphanumeric characters only and no spaces or other
-        formatting characters.
+        Returns the algorithm name, used for identifying the algorithm.
         """
         return 'EvaluateEnergyStorageSites'
 
     def displayName(self):
         """
-        Returns the translated algorithm name, which should be used for any
-        user-visible display of the algorithm name.
+        Returns the translated algorithm name.
         """
         return self.tr(self.name())
 
     def group(self):
         """
-        Returns the name of the group this algorithm belongs to. This string
-        should be localised.
+        Returns the name of the group this algorithm belongs to.
         """
         return self.tr(self.groupId())
 
     def groupId(self):
         """
-        Returns the unique ID of the group this algorithm belongs to. This
-        string should be fixed for the algorithm, and must not be localised.
-        The group id should be unique within each provider. Group id should
-        contain lowercase alphanumeric characters only and no spaces or other
-        formatting characters.
+        Returns the unique ID of the group this algorithm belongs to.
         """
         return 'Energy Storage Evaluation'
 
